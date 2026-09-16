@@ -38,6 +38,7 @@
 
 
 char *g_cmt_save_fileext[] = {
+                              "wav",
                               NULL
 };
 
