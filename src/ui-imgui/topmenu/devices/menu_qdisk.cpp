@@ -298,8 +298,11 @@ void imgui_menu_qdisk(void)
          * v qdisk_open_image_internal). MenuItem zobrazujeme zaškrtnutý a
          * disabled (gray) - user vidí, že R/O platí, ale nedá se přepnout. */
         bool is_unicard = (QDISK_TEST_CONNECTED && QDISK_TEST_TYPE_UNICARD);
-        bool wrprot_enabled = (QDISK_TEST_CONNECTED && !QDISK_TEST_TYPE_UNICARD);
-        bool wrprot_shown = is_unicard ? true : (qdisc_get_write_protected() != 0);
+        bool is_qd_readonly = (QDISK_TEST_CONNECTED && QDISK_TEST_TYPE_IMAGE
+                               && g_qdisk.format_readonly);
+        bool wrprot_enabled = (QDISK_TEST_CONNECTED && !is_unicard && !is_qd_readonly);
+        bool wrprot_shown = (is_unicard || is_qd_readonly)
+                          ? true : (qdisc_get_write_protected() != 0);
 
         if (ImGui::MenuItem(_L("Write Protected"), NULL, wrprot_shown, wrprot_enabled))
         {
@@ -308,6 +311,10 @@ void imgui_menu_qdisk(void)
         if (is_unicard && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         {
             ImGui::SetTooltip(_("Forced R/O by UNICARD - cannot be changed."));
+        };
+        if (is_qd_readonly && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        {
+            ImGui::SetTooltip(_("The .qd format is currently supported for reading only."));
         };
 
         /* Faze 2: vizualni indikator fs_readonly. Pokud je soubor na disku
@@ -348,7 +355,8 @@ void imgui_menu_qdisk(void)
          *   - UNICARD (Faze 5): uzamceno na CACHED runtime, nezavisle na INI.
          *     Submenu je disabled (sede); tooltip vysvetli proc.
          */
-        bool storage_enabled = QDISK_TEST_CONNECTED && QDISK_TEST_TYPE_IMAGE;
+        bool storage_enabled = QDISK_TEST_CONNECTED && QDISK_TEST_TYPE_IMAGE
+                               && !is_qd_readonly;
 
         if (ImGui::BeginMenu(_L("Storage mode"), storage_enabled))
         {
@@ -392,6 +400,10 @@ void imgui_menu_qdisk(void)
         if (is_unicard && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         {
             ImGui::SetTooltip(_("UNICARD mode is locked to Cached storage."));
+        };
+        if (is_qd_readonly && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        {
+            ImGui::SetTooltip(_("Read-only .qd images are decoded into a cached in-memory stream."));
         };
 
         ImGui::Separator();

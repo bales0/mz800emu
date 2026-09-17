@@ -229,18 +229,20 @@ typedef struct st_QDISK
     int handler_valid;         /**< 1 = handler je otevřený, je třeba close */
     char filename[1024];       /**< plná cesta k aktuálně mountnutému image souboru */
 
-    /* Fáze 2 (qdisk-rewrite): 3-state Read-Only model (paralela k FDC).
+    /* Read-Only model (paralela k FDC).
      *
      *   user_readonly = persistentní user volba (CFGELM "mz1f11_write_protected")
      *   fs_readonly   = runtime auto-detekce z filesystému (W_OK access)
-     *   readonly      = efektivní (= user_readonly || fs_readonly)
+     *   format_readonly = zdrojový formát je podporován jen pro čtení (.qd)
+     *   readonly      = efektivní OR všech tří důvodů
      *
      * Status flag QDSTS_IMG_READONLY i handler.status READ_ONLY bit reflektují
      * efektivní hodnotu. Pole se přepočítává v qdisk_open_image() a v
      * qdisk_set_write_protected(); v qdisk_close() se vynulují. */
     int user_readonly;         /**< persistentní user pref (mirror CFGELM mz1f11_write_protected) */
     int fs_readonly;           /**< runtime: soubor nemá W_OK přístup */
-    int readonly;              /**< efektivní = user_readonly || fs_readonly */
+    int format_readonly;       /**< runtime: importovaný .qd je vždy R/O */
+    int readonly;              /**< efektivní ochrana proti zápisu */
 
     /* Fáze 3 (qdisk-rewrite): volba storage mode (CACHED / DIRECT / DISCARD).
      * Hodnota se čte z CFGELM mz1f11_storage_mode v qdisk_open_image() a řídí

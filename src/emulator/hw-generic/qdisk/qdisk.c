@@ -46,6 +46,7 @@
 
 #include "qdisk.h"
 #include "libs/sharpmz_ascii/sharpmz_ascii.h"
+#include "libs/qd_image/qd_image.h"
 
 
 #ifdef COMPILE_FOR_UNICARD
@@ -127,6 +128,14 @@ static const char *qdisk_storage_mode_to_string ( en_QDISK_STORAGE_MODE m ) {
         case QDISK_STORAGE_CACHED:
         default:                    return "cached";
     };
+}
+
+/** Return non-zero when filepath has a case-insensitive .qd extension. */
+static int qdisk_path_is_qd ( const char *filepath ) {
+    const char *dot;
+    if ( filepath == NULL ) return 0;
+    dot = strrchr ( filepath, '.' );
+    return dot != NULL && strcasecmp ( dot, ".qd" ) == 0;
 }
 #endif
 
@@ -334,6 +343,7 @@ void qdisk_close ( void ) {
                      * při dalším mount). */
                     g_qdisk.user_readonly = 0;
                     g_qdisk.fs_readonly = 0;
+                    g_qdisk.format_readonly = 0;
                     g_qdisk.readonly = 0;
                     /* Faze 3: storage_mode se přepočte při příštím mount z
                      * CFGELM. Reset na CACHED (= default) je bezpečný - žádný
@@ -413,10 +423,9 @@ void qdisk_virt_open_directory ( char *dirpath ) {
 
     if ( g_qdisk.connected == QDISK_CONNECTED ) {
 
-        g_qdisk.status = QDSTS_NO_DISC;
-
-        qdisk_drive_reset ( );
         qdisk_close ( );
+        g_qdisk.status = QDSTS_NO_DISC;
+        qdisk_drive_reset ( );
 
         if ( strlen ( dirpath ) != 0 ) {
 
@@ -489,10 +498,9 @@ static void qdisk_open_image_internal ( const char *filepath,
 
     if ( g_qdisk.connected == QDISK_CONNECTED ) {
 
-        g_qdisk.status = QDSTS_NO_DISC;
-
-        qdisk_drive_reset ( );
         qdisk_close ( );
+        g_qdisk.status = QDSTS_NO_DISC;
+        qdisk_drive_reset ( );
 
         if ( strlen ( filepath ) != 0 ) {
 
@@ -510,7 +518,9 @@ static void qdisk_open_image_internal ( const char *filepath,
                 g_qdisk.user_readonly = cfgelement_get_bool_value ( g_elm_wrprt ) ? 1 : 0;
             };
             g_qdisk.fs_readonly = ( baseui_tools_file_access ( filepath, W_OK ) == -1 ) ? 1 : 0;
-            g_qdisk.readonly = ( g_qdisk.user_readonly || g_qdisk.fs_readonly ) ? 1 : 0;
+            g_qdisk.format_readonly = 0;
+            g_qdisk.readonly = ( g_qdisk.user_readonly || g_qdisk.fs_readonly
+                              || g_qdisk.format_readonly ) ? 1 : 0;
             readonly_effective = g_qdisk.readonly;
             read_only_flag = readonly_effective ? QDSTS_IMG_READONLY : 0;
 
@@ -607,10 +617,9 @@ static void qdisk_open_image_from_buffer_internal ( const uint8_t *data,
         return;
     };
 
-    g_qdisk.status = QDSTS_NO_DISC;
-
-    qdisk_drive_reset ( );
     qdisk_close ( );
+    g_qdisk.status = QDSTS_NO_DISC;
+    qdisk_drive_reset ( );
 
     if ( ( data == NULL ) || ( size == 0 ) ) return;
 
@@ -618,6 +627,7 @@ static void qdisk_open_image_from_buffer_internal ( const uint8_t *data,
      * volající si R/O vynucuje přes user_readonly = 1 (= CFGELM-bypass). */
     g_qdisk.user_readonly = 1;
     g_qdisk.fs_readonly = 0;
+    g_qdisk.format_readonly = 0;
     g_qdisk.readonly = 1;
     unsigned read_only_flag = QDSTS_IMG_READONLY;
 
@@ -652,6 +662,76 @@ static void qdisk_open_image_from_buffer_internal ( const uint8_t *data,
     generic_driver_set_handler_readonly_status ( &g_qdisk.handler, 1 );
     g_qdisk.status = QDSTS_IMG_READY | QDSTS_HEAD_HOME | read_only_flag;
 }
+
+
+/**
+ * Decode an external .qd representation and mount its logical stream in RAM.
+ *
+ * .qd support is intentionally read-only: writing the internal MZQ stream
+ * back over an HxC/FlashFloppy container (or over a legacy image with a
+ * different fixed layout) would corrupt the source file.
+ */
+static void qdisk_open_qd_image_internal ( const char *filepath,
+                                           int force_user_readonly,
+                                           int suppress_cfg_write ) {
+    gchar *source = NULL;
+    gsize source_size = 0;
+    GError *io_error = NULL;
+    uint8_t *logical = NULL;
+    size_t logical_size = 0;
+    mz_qd_image_error_t decode_error;
+
+    if ( g_qdisk.connected != QDISK_CONNECTED ) {
+        g_qdisk.status = QDSTS_NO_DISC;
+        return;
+    };
+
+    qdisk_close ( );
+    g_qdisk.status = QDSTS_NO_DISC;
+    qdisk_drive_reset ( );
+
+    if ( !g_file_get_contents ( filepath, &source, &source_size, &io_error ) ) {
+        baseui_error ( "Can't open file '%s': %s", filepath,
+                       io_error != NULL ? io_error->message : "read error" );
+        if ( io_error != NULL ) g_error_free ( io_error );
+        if ( !suppress_cfg_write ) cfgelement_set_text_value ( g_elm_std_fp, "" );
+        return;
+    };
+
+    decode_error = mz_qd_image_decode ( (const uint8_t*) source, (size_t) source_size,
+                                        &logical, &logical_size, NULL );
+    g_free ( source );
+    if ( decode_error != MZ_QD_IMAGE_OK || logical_size > QDISK_IMAGE_MAX_SIZE ) {
+        const char *message = decode_error != MZ_QD_IMAGE_OK
+                            ? mz_qd_image_error_string ( decode_error )
+                            : "decoded Quick Disk image exceeds emulator capacity";
+        fprintf ( stderr, "%s(%d): failed to decode QD image '%s': %s\n",
+                  __FILE__, __LINE__, filepath, message );
+        baseui_error ( "Can't open QD image '%s': %s", filepath, message );
+        free ( logical );
+        if ( !suppress_cfg_write ) cfgelement_set_text_value ( g_elm_std_fp, "" );
+        return;
+    };
+
+    qdisk_open_image_from_buffer_internal ( logical, (uint32_t) logical_size, filepath );
+    free ( logical );
+    if ( !g_qdisk.handler_valid ) {
+        if ( !suppress_cfg_write ) cfgelement_set_text_value ( g_elm_std_fp, "" );
+        return;
+    };
+
+    g_qdisk.user_readonly = force_user_readonly >= 0
+                           ? ( force_user_readonly ? 1 : 0 )
+                           : ( cfgelement_get_bool_value ( g_elm_wrprt ) ? 1 : 0 );
+    g_qdisk.fs_readonly = ( baseui_tools_file_access ( filepath, W_OK ) == -1 ) ? 1 : 0;
+    g_qdisk.format_readonly = 1;
+    g_qdisk.readonly = 1;
+    g_qdisk.storage_mode = QDISK_STORAGE_CACHED;
+    generic_driver_set_handler_readonly_status ( &g_qdisk.handler, 1 );
+    g_qdisk.status |= QDSTS_IMG_READONLY;
+
+    if ( !suppress_cfg_write ) cfgelement_set_text_value ( g_elm_std_fp, (char*) filepath );
+}
 #endif /* COMPILE_FOR_EMULATOR */
 
 
@@ -660,17 +740,20 @@ void qdisk_open_image ( char *filepath ) {
     /* Veřejné API - defaultní mount, hodnoty z CFGELM. UNICARD lock branch
      * (Faze 5) volá qdisk_open_image_internal() s explicitními override
      * hodnotami, ne přes tuto funkci. */
-    qdisk_open_image_internal ( filepath, -1, -1, 0 );
+    if ( qdisk_path_is_qd ( filepath ) ) {
+        qdisk_open_qd_image_internal ( filepath, -1, 0 );
+    } else {
+        qdisk_open_image_internal ( filepath, -1, -1, 0 );
+    };
 #else
     /* Unicard FW build - generic_driver neni dostupny, ponecháváme původní
      * FS_LAYER cestu beze změny (3-state R/O pole neexistují, storage mode
      * není zaveden). */
     if ( g_qdisk.connected == QDISK_CONNECTED ) {
 
-        g_qdisk.status = QDSTS_NO_DISC;
-
-        qdisk_drive_reset ( );
         qdisk_close ( );
+        g_qdisk.status = QDSTS_NO_DISC;
+        qdisk_drive_reset ( );
 
         if ( strlen ( filepath ) != 0 ) {
 
@@ -785,6 +868,12 @@ static void qdisk_ui_mount_cb(baseui_fchooser_t *fch)
         {
             fch->selected_filePathName = NULL;
             if ( baseui_tools_file_access ( filename, F_OK ) == -1 ) {
+                if ( qdisk_path_is_qd ( filename ) ) {
+                    baseui_error ( "Creating .qd images is not supported yet; select an existing .qd file or create an .mzq image." );
+                    free ( filename );
+                    baseui_filechooser_destroy ( fch );
+                    return;
+                };
                 /* soubor neexistuje - vyrobime novy */
                 //printf ( "create new: '%s'\n", filename );
                 qdisk_create_image ( filename );
@@ -792,6 +881,7 @@ static void qdisk_ui_mount_cb(baseui_fchooser_t *fch)
 
             qdisk_open_image ( filename );
             ui_qdisk_set_std_path ( cfgelement_get_text_value ( g_elm_std_fp ) );
+            free ( filename );
         };
     } else {
         /* virtual QDISK */
@@ -813,7 +903,7 @@ void qdisk_ui_mount ( void ) {
     baseui_fchooser_t *fch = NULL;
 
     if ( g_qdisk.type == QDISK_TYPE_IMAGE ) {
-        fch = baseui_filechooser_open_rw_file(_("Select existing .MZQ file or create new QD image"), ".mzq", NULL, NULL, cfgelement_get_text_value ( g_elm_std_fp ), qdisk_ui_mount_cb, NULL);
+        fch = baseui_filechooser_open_rw_file(_("Select an .MZQ or read-only .QD image"), ".mzq, .qd", NULL, NULL, cfgelement_get_text_value ( g_elm_std_fp ), qdisk_ui_mount_cb, NULL);
     } else {
         fch = baseui_filechooser_open_dir(_("Select directory to mount as virtual Quick Disk"), NULL, NULL, cfgelement_get_text_value ( g_elm_virt_fp ), qdisk_ui_mount_cb, NULL);
     };
@@ -853,7 +943,8 @@ void qdisk_set_write_protected ( int value ) {
      * je write-protected) - effective readonly zustane 1 a user to vidi
      * v UI jako [FS R/O] label. */
     g_qdisk.user_readonly = new_user_ro;
-    g_qdisk.readonly = ( g_qdisk.user_readonly || g_qdisk.fs_readonly ) ? 1 : 0;
+    g_qdisk.readonly = ( g_qdisk.user_readonly || g_qdisk.fs_readonly
+                      || g_qdisk.format_readonly ) ? 1 : 0;
 
     /* Propagace effective stavu do status flagu a do handleru. */
     if ( g_qdisk.readonly ) {
@@ -940,6 +1031,7 @@ void qdisk_init ( void ) {
      * dopočtou až v qdisk_open_image() po naplnění filename. */
     g_qdisk.user_readonly = cfgelement_get_bool_value ( g_elm_wrprt ) ? 1 : 0;
     g_qdisk.fs_readonly = 0;
+    g_qdisk.format_readonly = 0;
     g_qdisk.readonly = 0;
 
     /* Fáze 3: init storage_mode z perzistentního INI klíče. Skutečnou volbu

@@ -28,7 +28,7 @@ https://sourceforge.net/projects/mz800emu/
 - Široká podpora periferií:
   - Kazeta (CMT): MZF, MZT, TAP, WAV
   - Řadič disket (FDC WD279x)
-  - Quick Disk
+  - Quick Disk (`.mzq` čtení/zápis; staré, HxC a FlashFloppy `.qd` pouze pro čtení)
   - RAM disk, paměťová rozšíření
   - Unicard
   - IDE8 rozhraní pro pevný disk

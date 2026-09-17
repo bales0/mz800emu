@@ -163,23 +163,36 @@ int cmt_edge_encode_run(int value,
     if (!output || !written || (value != 0 && value != 1) || units == 0)
         return EXIT_FAILURE;
 
-    uint64_t needed64 = 1u + (units - 1u) / 127u;
+    /*
+     * A continuation byte 0x00 extends the PRECEDING non-zero interval by
+     * exactly 127 units.  Therefore a long run must be encoded as one
+     * signed non-zero remainder followed only by zero continuation bytes.
+     *
+     * Examples:
+     *   127 -> +127
+     *   254 -> +127, 0
+     *   255 -> +1,   0, 0
+     *   300 -> +46,  0, 0
+     *
+     * Do not emit +127,0,+46 for 300: QDTool deliberately keeps adjacent
+     * non-zero records separate, so that form would create a false run
+     * boundary even though the electrical level did not change.
+     */
+    uint64_t continuation_count = units / 127u;
+    uint8_t magnitude = (uint8_t) (units % 127u);
+    if (magnitude == 0) {
+        magnitude = 127;
+        continuation_count--;
+    }
+
+    uint64_t needed64 = 1u + continuation_count;
     if (needed64 > SIZE_MAX || (size_t) needed64 > capacity)
         return EXIT_FAILURE;
 
     size_t pos = 0;
-    uint8_t magnitude = (uint8_t) ((units > 127u) ? 127u : units);
     output[pos++] = value ? magnitude : (uint8_t) (0u - magnitude);
-    units -= magnitude;
-
-    while (units >= 127u) {
+    while (continuation_count-- != 0)
         output[pos++] = 0;
-        units -= 127u;
-    }
-    if (units != 0) {
-        magnitude = (uint8_t) units;
-        output[pos++] = value ? magnitude : (uint8_t) (0u - magnitude);
-    }
 
     *written = pos;
     return EXIT_SUCCESS;
@@ -190,22 +203,19 @@ static int cmt_edge_write_run(FILE *fh, int value, uint64_t units)
     if (units == 0)
         return EXIT_FAILURE;
 
-    uint8_t byte;
-    uint8_t magnitude = (uint8_t) ((units > 127u) ? 127u : units);
-    byte = value ? magnitude : (uint8_t) (0u - magnitude);
+    uint64_t continuation_count = units / 127u;
+    uint8_t magnitude = (uint8_t) (units % 127u);
+    if (magnitude == 0) {
+        magnitude = 127;
+        continuation_count--;
+    }
+
+    uint8_t byte = value ? magnitude : (uint8_t) (0u - magnitude);
     if (baseui_tools_file_write(&byte, 1, 1, fh) != 1)
         return EXIT_FAILURE;
-    units -= magnitude;
 
     byte = 0;
-    while (units >= 127u) {
-        if (baseui_tools_file_write(&byte, 1, 1, fh) != 1)
-            return EXIT_FAILURE;
-        units -= 127u;
-    }
-    if (units != 0) {
-        magnitude = (uint8_t) units;
-        byte = value ? magnitude : (uint8_t) (0u - magnitude);
+    while (continuation_count-- != 0) {
         if (baseui_tools_file_write(&byte, 1, 1, fh) != 1)
             return EXIT_FAILURE;
     }
@@ -428,15 +438,43 @@ static void cmt_edge_record_write(uint64_t play_ticks, int value)
     st_CMTEXT_BLOCK *block = g_cmt_edge_save_extension.block;
     if (!block || !block->spec)
         return;
+
     st_CMTEDGE_RECORD_SPEC *spec = (st_CMTEDGE_RECORD_SPEC *) block->spec;
     if (spec->write_error)
         return;
 
-    if (cmt_edge_record_append(block, spec, play_ticks, value & 1) != EXIT_SUCCESS) {
+    /*
+     * cmt_write_data() invokes cb_write() AFTER PC1 changed and passes
+     * the inverted PC1 level.  That value is therefore the NEW physical
+     * cassette-connector level after the edge.
+     *
+     * LEP/L16, however, stores the duration of the level that existed
+     * BEFORE the edge.  The previous implementation appended "value"
+     * directly and then stored ~value as current_level.  That shifted the
+     * complete waveform by one half-wave.  QDTool then paired the wrong
+     * LOW/HIGH runs and could report:
+     *
+     *   "The tape waveform has a missing LONG byte-sync pulse."
+     *
+     * On the first observed edge the previous physical level is necessarily
+     * the opposite of the new level (pio8255 calls cmt_write_data only on a
+     * change).  On following edges we already know it in current_level.
+     */
+    int new_level = value & 1;
+    int interval_level;
+
+    if (!spec->have_edge) {
+        interval_level = (~new_level) & 1;
+    } else {
+        interval_level = spec->current_level & 1;
+    }
+
+    if (cmt_edge_record_append(block, spec, play_ticks, interval_level) != EXIT_SUCCESS) {
         spec->write_error = 1;
         return;
     }
-    spec->current_level = (~value) & 1;
+
+    spec->current_level = new_level;
     spec->have_edge = 1;
 }
 
