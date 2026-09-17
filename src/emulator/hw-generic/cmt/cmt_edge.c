@@ -22,7 +22,6 @@ typedef struct st_CMTEDGE_RECORD_SPEC {
     char *filepath;
     uint32_t rate;
     uint64_t last_ticks;
-    uint64_t emitted_units;
     int current_level;
     int have_edge;
     int write_error;
@@ -409,13 +408,27 @@ static int cmt_edge_record_append(st_CMTEXT_BLOCK *block,
     if (end_ticks <= spec->last_ticks)
         return EXIT_SUCCESS;
 
+    /*
+     * LEP/L16 is an edge-duration format: each stored run describes the
+     * width of one physical level between two adjacent edges.  Quantize that
+     * edge-to-edge interval independently.
+     *
+     * Do NOT quantize the absolute edge position and subtract a cumulative
+     * number of already emitted units.  At LEP's 50 us resolution that acts
+     * as error diffusion and can turn a stable ~250 us half-wave into a
+     * 200/300 us sequence.  Sharp loaders classify the individual half-wave,
+     * not the accumulated period, so preserving the local pulse width is more
+     * important than preserving the long-term phase of the quantization grid.
+     */
+    uint64_t delta_ticks = end_ticks - spec->last_ticks;
+
     int ok = 0;
-    uint64_t target_units = cmt_edge_ticks_to_units(end_ticks, spec->rate, &ok);
+    uint64_t count = cmt_edge_ticks_to_units(delta_ticks, spec->rate, &ok);
     if (!ok)
         return EXIT_FAILURE;
 
-    uint64_t count = target_units > spec->emitted_units
-        ? target_units - spec->emitted_units : 1;
+    if (count == 0)
+        count = 1;
     if (count > UINT32_MAX)
         return EXIT_FAILURE;
 
@@ -440,7 +453,6 @@ static int cmt_edge_record_append(st_CMTEXT_BLOCK *block,
         return EXIT_FAILURE;
 
     spec->last_ticks = end_ticks;
-    spec->emitted_units += count;
     return EXIT_SUCCESS;
 }
 

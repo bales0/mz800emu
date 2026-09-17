@@ -176,7 +176,7 @@ static void test_tick_conversion_has_no_cumulative_drift(void)
     TEST_ASSERT_TRUE(ok);
 }
 
-static void test_recorder_uses_native_rate_and_cumulative_ticks(void)
+static void test_recorder_uses_native_rate_and_edge_intervals(void)
 {
     TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS,
                           g_cmt_edge_save_extension.cb_open((char *) g_temp_path));
@@ -191,6 +191,42 @@ static void test_recorder_uses_native_rate_and_cumulative_ticks(void)
     cmt_vstream_read_reset(stream->str.vstream);
     assert_pulse(stream, CMT_EDGE_LEP_RATE, 0);
     assert_pulse(stream, CMT_EDGE_LEP_RATE, 1);
+
+    g_cmt_edge_save_extension.cb_eject();
+}
+
+static void test_recorder_quantizes_each_halfwave_independently(void)
+{
+    TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS,
+                          g_cmt_edge_save_extension.cb_open((char *) g_temp_path));
+    TEST_ASSERT_NOT_NULL(g_cmt_edge_save_extension.block);
+
+    /*
+     * 37/8 = 4.625 LEP units per half-wave (~231.25 us).  Each individual
+     * interval rounds to 5 units.  The old absolute/cumulative quantizer
+     * error-diffused this constant-width waveform as 5,4,5,5,4,... .
+     *
+     * For an edge-duration tape format that is undesirable: a Sharp loader
+     * samples one half-wave at a time, so constant physical widths must remain
+     * constant after quantization whenever they round to the same LEP slot.
+     */
+    uint64_t delta_ticks =
+        ((uint64_t) GDGCLK_BASE * 37u) /
+        ((uint64_t) CMT_EDGE_LEP_RATE * 8u);
+
+    TEST_ASSERT_EQUAL_UINT64(
+        5u, cmt_edge_ticks_to_units(delta_ticks, CMT_EDGE_LEP_RATE, NULL));
+
+    for (uint64_t edge = 1; edge <= 8; ++edge) {
+        g_cmt_edge_save_extension.cb_write(delta_ticks * edge, (int) (edge & 1u));
+    }
+
+    st_CMT_STREAM *stream = g_cmt_edge_save_extension.block->stream;
+    TEST_ASSERT_NOT_NULL(stream);
+    cmt_vstream_read_reset(stream->str.vstream);
+
+    for (int pulse = 0; pulse < 8; ++pulse)
+        assert_pulse(stream, 5, pulse & 1);
 
     g_cmt_edge_save_extension.cb_eject();
 }
@@ -224,7 +260,8 @@ int main(int argc, char *argv[])
     RUN_TEST(test_encode_rejects_invalid_arguments);
     RUN_TEST(test_file_roundtrip_preserves_pulses);
     RUN_TEST(test_tick_conversion_has_no_cumulative_drift);
-    RUN_TEST(test_recorder_uses_native_rate_and_cumulative_ticks);
+    RUN_TEST(test_recorder_uses_native_rate_and_edge_intervals);
+    RUN_TEST(test_recorder_quantizes_each_halfwave_independently);
     RUN_TEST(test_recording_extension_selection);
     int result = UNITY_END();
 

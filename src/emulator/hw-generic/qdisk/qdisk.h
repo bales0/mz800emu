@@ -217,6 +217,12 @@ typedef struct st_QDISK
 #endif
     uint16_t out_crc16;
     unsigned image_position;
+    unsigned write_capacity_exceeded; /**< zápis narazil na konec média */
+    unsigned write_capacity_warning_shown; /**< varování již zobrazeno pro tuto sérii pokusů */
+    unsigned write_header_bytes;      /**< počet rozpoznaných bajtů MZF header bloku */
+    unsigned write_sync_match;        /**< průběžná shoda 00 16 16 A5 při zápisu */
+    unsigned write_frame_bytes_left;  /**< zbytek již ověřeného MZF header+body páru */
+    uint8_t write_mzf_size_low;       /**< low byte deklarované délky MZF body */
 
     unsigned virt_status;
     unsigned virt_files_count;
@@ -235,6 +241,9 @@ typedef struct st_QDISK
     st_HANDLER handler;        /**< generic_driver handle pro IMAGE / UNICARD */
     int handler_valid;         /**< 1 = handler je otevřený, je třeba close */
     char filename[1024];       /**< plná cesta k aktuálně mountnutému image souboru */
+    uint8_t *write_rollback;   /**< kopie RAM image před aktuálním zápisem */
+    size_t write_rollback_size;
+    int write_rollback_updated;
 
     /* Read-Only model (paralela k FDC).
      *
