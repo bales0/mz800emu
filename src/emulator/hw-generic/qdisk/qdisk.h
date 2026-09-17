@@ -56,7 +56,8 @@
  *  - `QDISK_STORAGE_CACHED`  (0): celé image v RAM (memory_driver), sync do
  *    souboru při reset / umount / exit / manual. Default.
  *  - `QDISK_STORAGE_DIRECT`  (1): immediate write-through na FILE*
- *    (file_driver). Žádný RAM buffer.
+ *    (file_driver). Žádný RAM buffer. Dostupné pouze pro nativní `.mzq`;
+ *    externí `.qd` vyžaduje převod celého kontejneru při uložení.
  *  - `QDISK_STORAGE_DISCARD` (2): celé image v RAM (memory_driver), ale NIKDY
  *    sync zpět. Pro test runs bez modifikace zdrojového souboru.
  *
@@ -69,6 +70,13 @@ typedef enum en_QDISK_STORAGE_MODE
     QDISK_STORAGE_DIRECT  = 1,
     QDISK_STORAGE_DISCARD = 2
 } en_QDISK_STORAGE_MODE;
+
+typedef enum en_QDISK_CREATE_QD_FORMAT
+{
+    QDISK_CREATE_QD_SHARP_LEGACY = 0,
+    QDISK_CREATE_QD_HXC,
+    QDISK_CREATE_QD_FLASHFLOPPY
+} en_QDISK_CREATE_QD_FORMAT;
 #endif
 
 // tuto hodnotu jseme kdysi v konferenci namerili jako max
@@ -221,10 +229,9 @@ typedef struct st_QDISK
     char *ui_virt_filepath;
     int ui_wrprt;
 
-    /* Fáze 1 (qdisk-rewrite): generic_driver napojení pro IMAGE / UNICARD.
-     * VIRTUAL režim handler nepoužívá. Storage mode volba (CACHED / DIRECT
-     * / DISCARD) přijde v pozdější fázi - aktuálně se vždy používá
-     * g_memory_driver_static (= CACHED ekvivalent). */
+    /* generic_driver napojení pro IMAGE / UNICARD. VIRTUAL režim handler
+     * nepoužívá. `.mzq` podporuje CACHED / DIRECT / DISCARD; externí `.qd`
+     * používá memory driver v režimu CACHED nebo DISCARD. */
     st_HANDLER handler;        /**< generic_driver handle pro IMAGE / UNICARD */
     int handler_valid;         /**< 1 = handler je otevřený, je třeba close */
     char filename[1024];       /**< plná cesta k aktuálně mountnutému image souboru */
@@ -233,15 +240,15 @@ typedef struct st_QDISK
      *
      *   user_readonly = persistentní user volba (CFGELM "mz1f11_write_protected")
      *   fs_readonly   = runtime auto-detekce z filesystému (W_OK access)
-     *   format_readonly = zdrojový formát je podporován jen pro čtení (.qd)
-     *   readonly      = efektivní OR všech tří důvodů
+     *   external_qd   = obraz používá .qd kontejner a při sync se převádí
+     *   readonly      = efektivní OR user_readonly a fs_readonly
      *
      * Status flag QDSTS_IMG_READONLY i handler.status READ_ONLY bit reflektují
      * efektivní hodnotu. Pole se přepočítává v qdisk_open_image() a v
      * qdisk_set_write_protected(); v qdisk_close() se vynulují. */
     int user_readonly;         /**< persistentní user pref (mirror CFGELM mz1f11_write_protected) */
     int fs_readonly;           /**< runtime: soubor nemá W_OK přístup */
-    int format_readonly;       /**< runtime: importovaný .qd je vždy R/O */
+    int external_qd;           /**< runtime: .qd kontejner převáděný při sync */
     int readonly;              /**< efektivní ochrana proti zápisu */
 
     /* Fáze 3 (qdisk-rewrite): volba storage mode (CACHED / DIRECT / DISCARD).
@@ -292,6 +299,9 @@ extern "C"
     void qdisk_umount(void);
     void qdisk_set_write_protected(int value);
     void qdisk_create_image(char *filename);
+#ifdef COMPILE_FOR_EMULATOR
+    void qdisk_create_qd_image(char *filename, en_QDISK_CREATE_QD_FORMAT format);
+#endif
     void qdisk_activate_unicard_boot_loader(void);
     void qdisk_deactivate_unicard_boot_loader(void);
     int qdisc_get_write_protected(void);
@@ -300,10 +310,10 @@ extern "C"
     /**
      * @brief Vrať aktuální storage mode jako string z CFGELM.
      *
-     * Hodnota je vždy jedna z "cached"/"direct"/"discard" (CFGELM default
-     * "cached" garantuje, že nevrací NULL nebo prázdný string).
+     * U připojeného image vrací efektivní runtime režim, jinak perzistentní
+     * volbu z CFGELM. Hodnota je vždy "cached", "direct" nebo "discard".
      *
-     * @return Konstantní string z CFGELM bufferu. NEUVOLŇOVAT.
+     * @return Konstantní string. NEUVOLŇOVAT.
      */
     const char *qdisk_get_storage_mode_str(void);
 
@@ -316,7 +326,8 @@ extern "C"
      * pokud není potřeba prompt (UI vrstva má vlastní switch popup).
      *
      * @param target_mode "cached" | "direct" | "discard". Neznámá hodnota =
-     *                    fallback na CACHED (přes parser).
+     *                    fallback na CACHED (přes parser). DIRECT požadavek
+     *                    je při připojeném `.qd` odmítnut.
      */
     void qdisk_apply_storage_mode_switch(const char *target_mode);
 

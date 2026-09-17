@@ -70,7 +70,18 @@ st_CMT_STREAM *cmt_edge_stream_from_data(const uint8_t *data,
         return NULL;
 
     int first_slot = cmt_edge_decode_slot(data[0]);
-    int level = first_slot > 0;
+
+    /*
+     * LEP/L16 stores the physical level on the external CMT connector:
+     * positive = HIGH, negative = LOW.  Sharp's cassette interface inverts
+     * that signal before it reaches 8255 PC5, while g_cmt.output represents
+     * the logical PC5 level directly.  Convert at this boundary so the
+     * emulated software observes the same signal as on real hardware.
+     *
+     * The user-selectable CMT polarity is applied afterwards and therefore
+     * remains an additional inversion, matching WAV playback behaviour.
+     */
+    int level = first_slot < 0;
 
     st_CMT_STREAM *stream = cmt_stream_new(CMT_STREAM_TYPE_VSTREAM);
     if (!stream)
@@ -92,7 +103,7 @@ st_CMT_STREAM *cmt_edge_stream_from_data(const uint8_t *data,
         if (slot == 0) {
             units = 127;
         } else {
-            level = slot > 0;
+            level = slot < 0;
             /* Widen before negation: INT8_MIN is intentionally accepted as
              * the reference player's LOW run of 128 units. */
             units = (uint32_t) (slot < 0 ? -slot : slot);

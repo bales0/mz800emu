@@ -1,5 +1,5 @@
 /*
- * qd_image.c - read-only Sharp Quick Disk .qd decoder
+ * qd_image.c - Sharp Quick Disk .qd codec
  *
  * Physical HxC/FlashFloppy images store an LSB-first MFM bit-cell stream.
  * There is no guaranteed byte phase, so all sixteen possible data-cell
@@ -20,10 +20,50 @@
 #define QD_MIN_TRACK_OFFSET       0x400u
 #define QD_HEADER_DATA_SIZE       64u
 #define QD_PHYSICAL_HEADER_SIZE   70u
+#define QD_LEGACY_IMAGE_SIZE      0xf00fu
+#define QD_LEGACY_MIN_TAIL_SIZE   8u
+#define QD_PHYSICAL_SYNC_SIZE     10u
+#define QD_PHYSICAL_POST_SYNC     7u
 
 static const uint8_t s_logical_start[4] = { 0x00, 0x16, 0x16, 0xa5 };
 static const uint8_t s_logical_crc[3] = { 'C', 'R', 'C' };
 static const uint8_t s_hxc_signature[8] = { 'H', 'X', 'C', 'Q', 'D', 'D', 'R', 'V' };
+
+mz_qd_image_error_t mz_qd_image_profile_init_default (
+                                         mz_qd_image_profile_t *profile,
+                                         mz_qd_image_format_t format ) {
+    if ( profile == NULL ) return MZ_QD_IMAGE_ERROR_ARGUMENT;
+    memset ( profile, 0, sizeof ( *profile ) );
+    profile->format = format;
+
+    if ( format == MZ_QD_IMAGE_FORMAT_SHARP_LOGICAL ) {
+        profile->container_size = QD_LEGACY_IMAGE_SIZE;
+        return MZ_QD_IMAGE_OK;
+    };
+
+    profile->container_size = 0x32000u;
+    profile->descriptor_offset = 0x200u;
+    profile->track_offset = 0x400u;
+    profile->stored_track_length = 0x31c00u;
+    if ( format == MZ_QD_IMAGE_FORMAT_HXC ) {
+        profile->track_length = 0x31c00u;
+        profile->window_start = 0x3200u;
+        profile->window_end = 0x25600u;
+        profile->bit_rate = 203388u;
+        profile->blank_filler = 0x01u;
+        return MZ_QD_IMAGE_OK;
+    };
+    if ( format == MZ_QD_IMAGE_FORMAT_FLASHFLOPPY ) {
+        profile->track_length = 0x31a99u;
+        profile->window_start = 0x31a9u;
+        profile->window_end = 0x2b745u;
+        profile->blank_filler = 0x11u;
+        return MZ_QD_IMAGE_OK;
+    };
+
+    memset ( profile, 0, sizeof ( *profile ) );
+    return MZ_QD_IMAGE_ERROR_ARGUMENT;
+}
 
 typedef struct qd_frame {
     size_t position;
@@ -47,6 +87,13 @@ static uint32_t read_le32 ( const uint8_t *p ) {
          | ( (uint32_t) p[1] << 8 )
          | ( (uint32_t) p[2] << 16 )
          | ( (uint32_t) p[3] << 24 );
+}
+
+static void write_le32 ( uint8_t *p, uint32_t value ) {
+    p[0] = (uint8_t) value;
+    p[1] = (uint8_t) ( value >> 8 );
+    p[2] = (uint8_t) ( value >> 16 );
+    p[3] = (uint8_t) ( value >> 24 );
 }
 
 static int has_logical_start ( const uint8_t *p ) {
@@ -74,7 +121,9 @@ mz_qd_image_format_t mz_qd_image_detect ( const uint8_t *image, size_t image_siz
     return MZ_QD_IMAGE_FORMAT_UNKNOWN;
 }
 
-static mz_qd_image_error_t validate_logical ( const uint8_t *image, size_t image_size ) {
+static mz_qd_image_error_t validate_logical ( const uint8_t *image,
+                                               size_t image_size,
+                                               size_t *content_size ) {
     size_t position = 8;
     unsigned block_count;
     unsigned file;
@@ -118,6 +167,7 @@ static mz_qd_image_error_t validate_logical ( const uint8_t *image, size_t image
         position += (size_t) body_size + 10u;
     }
 
+    if ( content_size != NULL ) *content_size = position;
     return MZ_QD_IMAGE_OK;
 }
 
@@ -138,6 +188,22 @@ static int has_valid_crc ( const uint8_t *frame, size_t size ) {
     size_t i;
     for ( i = 0; i < size; ++i ) crc = qd_crc_update ( crc, frame[i] );
     return crc == 0;
+}
+
+static uint8_t reverse_bits ( uint8_t value ) {
+    value = (uint8_t) ( ( ( value & 0x55u ) << 1 ) | ( ( value >> 1 ) & 0x55u ) );
+    value = (uint8_t) ( ( ( value & 0x33u ) << 2 ) | ( ( value >> 2 ) & 0x33u ) );
+    return (uint8_t) ( ( value << 4 ) | ( value >> 4 ) );
+}
+
+static void append_crc ( uint8_t *frame, size_t size_without_crc ) {
+    uint16_t crc = 0;
+    size_t i;
+    for ( i = 0; i < size_without_crc; ++i ) {
+        crc = qd_crc_update ( crc, frame[i] );
+    }
+    frame[size_without_crc] = reverse_bits ( (uint8_t) ( crc >> 8 ) );
+    frame[size_without_crc + 1u] = reverse_bits ( (uint8_t) crc );
 }
 
 static int get_lsb_first_bit ( const uint8_t *bytes, size_t position ) {
@@ -425,7 +491,8 @@ static mz_qd_image_error_t decode_physical ( const uint8_t *image,
                                              size_t image_size,
                                              mz_qd_image_format_t format,
                                              uint8_t **output,
-                                             size_t *output_size ) {
+                                             size_t *output_size,
+                                             mz_qd_image_profile_t *profile ) {
     uint32_t descriptor_offset;
     uint32_t track_offset;
     uint32_t track_length;
@@ -435,6 +502,8 @@ static mz_qd_image_error_t decode_physical ( const uint8_t *image,
     const uint8_t *track;
     qd_frame_list_t frames = { 0 };
     mz_qd_image_error_t error;
+
+    if ( image_size > UINT32_MAX ) return MZ_QD_IMAGE_ERROR_UNSUPPORTED;
 
     if ( format == MZ_QD_IMAGE_FORMAT_HXC ) {
         uint32_t tracks;
@@ -482,7 +551,61 @@ static mz_qd_image_error_t decode_physical ( const uint8_t *image,
         error = build_logical_from_frames ( &frames, output, output_size );
     }
     frame_list_free ( &frames );
+    if ( error == MZ_QD_IMAGE_OK && profile != NULL ) {
+        memset ( profile, 0, sizeof ( *profile ) );
+        profile->format = format;
+        profile->container_size = (uint32_t) image_size;
+        profile->descriptor_offset = descriptor_offset;
+        profile->track_offset = track_offset;
+        profile->track_length = track_length;
+        profile->stored_track_length = (uint32_t) ( image_size - track_offset );
+        profile->window_start = window_start;
+        profile->window_end = window_end;
+        profile->bit_rate = format == MZ_QD_IMAGE_FORMAT_HXC
+                          ? read_le32 ( image + 28u ) : 0u;
+        profile->blank_filler = format == MZ_QD_IMAGE_FORMAT_HXC ? 0x01u : 0x11u;
+    }
     return error;
+}
+
+mz_qd_image_error_t mz_qd_image_decode_with_profile (
+                                         const uint8_t *image,
+                                         size_t image_size,
+                                         uint8_t **logical_image,
+                                         size_t *logical_size,
+                                         mz_qd_image_profile_t *profile ) {
+    mz_qd_image_format_t detected;
+    mz_qd_image_error_t error;
+
+    if ( profile != NULL ) memset ( profile, 0, sizeof ( *profile ) );
+    if ( logical_image == NULL || logical_size == NULL ) return MZ_QD_IMAGE_ERROR_ARGUMENT;
+    *logical_image = NULL;
+    *logical_size = 0;
+    if ( image == NULL || image_size == 0 ) return MZ_QD_IMAGE_ERROR_ARGUMENT;
+    if ( image_size > UINT32_MAX ) return MZ_QD_IMAGE_ERROR_UNSUPPORTED;
+
+    detected = mz_qd_image_detect ( image, image_size );
+    if ( profile != NULL ) profile->format = detected;
+    if ( detected == MZ_QD_IMAGE_FORMAT_UNKNOWN ) return MZ_QD_IMAGE_ERROR_FORMAT;
+
+    if ( detected == MZ_QD_IMAGE_FORMAT_SHARP_LOGICAL ) {
+        uint8_t *copy;
+        error = validate_logical ( image, image_size, NULL );
+        if ( error != MZ_QD_IMAGE_OK ) return error;
+        copy = (uint8_t*) malloc ( image_size );
+        if ( copy == NULL ) return MZ_QD_IMAGE_ERROR_MEMORY;
+        memcpy ( copy, image, image_size );
+        *logical_image = copy;
+        *logical_size = image_size;
+        if ( profile != NULL ) {
+            profile->format = detected;
+            profile->container_size = (uint32_t) image_size;
+        }
+        return MZ_QD_IMAGE_OK;
+    }
+
+    return decode_physical ( image, image_size, detected, logical_image, logical_size,
+                             profile );
 }
 
 mz_qd_image_error_t mz_qd_image_decode ( const uint8_t *image,
@@ -490,44 +613,272 @@ mz_qd_image_error_t mz_qd_image_decode ( const uint8_t *image,
                                          uint8_t **logical_image,
                                          size_t *logical_size,
                                          mz_qd_image_format_t *format ) {
-    mz_qd_image_format_t detected;
-    mz_qd_image_error_t error;
+    mz_qd_image_profile_t profile = { 0 };
+    mz_qd_image_error_t error = mz_qd_image_decode_with_profile (
+        image, image_size, logical_image, logical_size, &profile );
+    if ( format != NULL ) *format = profile.format;
+    return error;
+}
 
-    if ( logical_image == NULL || logical_size == NULL ) return MZ_QD_IMAGE_ERROR_ARGUMENT;
-    *logical_image = NULL;
-    *logical_size = 0;
-    if ( format != NULL ) *format = MZ_QD_IMAGE_FORMAT_UNKNOWN;
-    if ( image == NULL || image_size == 0 ) return MZ_QD_IMAGE_ERROR_ARGUMENT;
-
-    detected = mz_qd_image_detect ( image, image_size );
-    if ( format != NULL ) *format = detected;
-    if ( detected == MZ_QD_IMAGE_FORMAT_UNKNOWN ) return MZ_QD_IMAGE_ERROR_FORMAT;
-
-    if ( detected == MZ_QD_IMAGE_FORMAT_SHARP_LOGICAL ) {
-        uint8_t *copy;
-        error = validate_logical ( image, image_size );
-        if ( error != MZ_QD_IMAGE_OK ) return error;
-        copy = (uint8_t*) malloc ( image_size );
-        if ( copy == NULL ) return MZ_QD_IMAGE_ERROR_MEMORY;
-        memcpy ( copy, image, image_size );
-        *logical_image = copy;
-        *logical_size = image_size;
-        return MZ_QD_IMAGE_OK;
+static mz_qd_image_error_t encode_legacy ( const uint8_t *logical,
+                                           size_t logical_size,
+                                           size_t target_size,
+                                           uint8_t **image,
+                                           size_t *image_size ) {
+    size_t content_size;
+    size_t position;
+    uint8_t *output;
+    mz_qd_image_error_t error = validate_logical ( logical, logical_size,
+                                                   &content_size );
+    if ( error != MZ_QD_IMAGE_OK ) return error;
+    if ( target_size == 0u ) target_size = QD_LEGACY_IMAGE_SIZE;
+    if ( target_size < QD_LEGACY_MIN_TAIL_SIZE
+      || content_size > target_size - QD_LEGACY_MIN_TAIL_SIZE ) {
+        return MZ_QD_IMAGE_ERROR_CAPACITY;
     }
 
-    return decode_physical ( image, image_size, detected, logical_image, logical_size );
+    output = (uint8_t*) calloc ( target_size, 1u );
+    if ( output == NULL ) return MZ_QD_IMAGE_ERROR_MEMORY;
+    memcpy ( output, logical, content_size );
+    position = content_size;
+    output[position++] = 0x00;
+    output[position++] = 0x16;
+    output[position++] = 0x16;
+    output[position++] = 0xa5;
+    {
+        int write_55 = 1;
+        while ( position < target_size - 4u ) {
+            output[position++] = write_55 ? 0x55u : 0xaau;
+            write_55 = !write_55;
+        }
+    }
+    memcpy ( output + position, s_logical_crc, sizeof ( s_logical_crc ) );
+    output[target_size - 1u] = 0x00;
+    *image = output;
+    *image_size = target_size;
+    return MZ_QD_IMAGE_OK;
+}
+
+static void write_framed ( uint8_t *stream,
+                           size_t *position,
+                           const uint8_t *frame,
+                           size_t frame_size,
+                           size_t trailing_zero_count ) {
+    size_t i;
+    stream[(*position)++] = 0x00;
+    for ( i = 0; i < QD_PHYSICAL_SYNC_SIZE; ++i ) stream[(*position)++] = 0x16;
+    memcpy ( stream + *position, frame, frame_size );
+    *position += frame_size;
+    for ( i = 0; i < QD_PHYSICAL_POST_SYNC; ++i ) stream[(*position)++] = 0x16;
+    memset ( stream + *position, 0, trailing_zero_count );
+    *position += trailing_zero_count;
+}
+
+static mz_qd_image_error_t build_physical_stream ( const uint8_t *logical,
+                                                    size_t logical_size,
+                                                    uint8_t **stream,
+                                                    size_t *stream_size ) {
+    size_t logical_position = 8u;
+    size_t output_size = 1u + QD_PHYSICAL_SYNC_SIZE + 4u
+                       + QD_PHYSICAL_POST_SYNC + 256u;
+    size_t output_position = 0;
+    unsigned block_count;
+    unsigned file;
+    uint8_t *output;
+    mz_qd_image_error_t error = validate_logical ( logical, logical_size, NULL );
+    if ( error != MZ_QD_IMAGE_OK ) return error;
+    block_count = logical[4];
+
+    for ( file = 0; file < block_count / 2u; ++file ) {
+        uint16_t body_size = read_le16 ( logical + logical_position + 27u );
+        if ( output_size > (size_t) -1 - 622u - body_size ) {
+            return MZ_QD_IMAGE_ERROR_MEMORY;
+        }
+        output_size += 622u + body_size;
+        logical_position += 84u + body_size;
+    }
+
+    output = (uint8_t*) malloc ( output_size );
+    if ( output == NULL ) return MZ_QD_IMAGE_ERROR_MEMORY;
+    {
+        uint8_t count_frame[4] = { 0xa5, (uint8_t) block_count, 0, 0 };
+        append_crc ( count_frame, 2u );
+        write_framed ( output, &output_position, count_frame,
+                       sizeof ( count_frame ), 256u );
+    }
+
+    logical_position = 8u;
+    for ( file = 0; file < block_count / 2u; ++file ) {
+        uint8_t header_frame[QD_PHYSICAL_HEADER_SIZE];
+        uint16_t body_size = read_le16 ( logical + logical_position + 27u );
+        uint8_t *body_frame;
+
+        memcpy ( header_frame, logical + logical_position + 3u, 68u );
+        append_crc ( header_frame, 68u );
+        write_framed ( output, &output_position, header_frame,
+                       sizeof ( header_frame ), 254u );
+        logical_position += 74u;
+
+        body_frame = (uint8_t*) malloc ( (size_t) body_size + 6u );
+        if ( body_frame == NULL ) {
+            free ( output );
+            return MZ_QD_IMAGE_ERROR_MEMORY;
+        }
+        memcpy ( body_frame, logical + logical_position + 3u,
+                 (size_t) body_size + 4u );
+        append_crc ( body_frame, (size_t) body_size + 4u );
+        write_framed ( output, &output_position, body_frame,
+                       (size_t) body_size + 6u, 256u );
+        free ( body_frame );
+        logical_position += (size_t) body_size + 10u;
+    }
+
+    *stream = output;
+    *stream_size = output_position;
+    return MZ_QD_IMAGE_OK;
+}
+
+static uint8_t *mfm_encode ( const uint8_t *data, size_t size ) {
+    uint8_t *encoded;
+    size_t output_bit = 0;
+    int previous = 0;
+    size_t i;
+    if ( size > (size_t) -1 / 2u ) return NULL;
+    encoded = (uint8_t*) calloc ( size * 2u, 1u );
+    if ( encoded == NULL ) return NULL;
+    for ( i = 0; i < size; ++i ) {
+        unsigned bit;
+        for ( bit = 0; bit < 8; ++bit ) {
+            int current = ( data[i] & ( 1u << bit ) ) != 0;
+            int clock = !previous && !current;
+            if ( clock ) {
+                encoded[output_bit >> 3] |= (uint8_t) ( 1u << ( output_bit & 7u ) );
+            }
+            ++output_bit;
+            if ( current ) {
+                encoded[output_bit >> 3] |= (uint8_t) ( 1u << ( output_bit & 7u ) );
+            }
+            ++output_bit;
+            previous = current;
+        }
+    }
+    return encoded;
+}
+
+static mz_qd_image_error_t encode_physical ( const uint8_t *logical,
+                                             size_t logical_size,
+                                             const mz_qd_image_profile_t *profile,
+                                             uint8_t **image,
+                                             size_t *image_size ) {
+    uint8_t *stream = NULL;
+    size_t stream_size = 0;
+    uint8_t *encoded = NULL;
+    size_t encoded_size;
+    uint8_t *output;
+    uint8_t *track;
+    mz_qd_image_error_t error;
+
+    if ( profile->container_size == 0u
+      || profile->descriptor_offset > profile->container_size
+      || profile->container_size - profile->descriptor_offset < QD_DESCRIPTOR_SIZE
+      || profile->track_offset < QD_MIN_TRACK_OFFSET
+      || profile->track_offset > profile->container_size
+      || profile->stored_track_length > profile->container_size - profile->track_offset
+      || profile->track_length == 0u
+      || profile->track_length > profile->stored_track_length
+      || profile->window_start > profile->window_end
+      || profile->window_end > profile->track_length ) {
+        return MZ_QD_IMAGE_ERROR_CORRUPT;
+    }
+
+    error = build_physical_stream ( logical, logical_size, &stream, &stream_size );
+    if ( error != MZ_QD_IMAGE_OK ) return error;
+    if ( stream_size > (size_t) -1 / 2u ) {
+        free ( stream );
+        return MZ_QD_IMAGE_ERROR_MEMORY;
+    }
+    encoded_size = stream_size * 2u;
+    if ( encoded_size > (size_t) ( profile->window_end - profile->window_start ) ) {
+        free ( stream );
+        return MZ_QD_IMAGE_ERROR_CAPACITY;
+    }
+    encoded = mfm_encode ( stream, stream_size );
+    free ( stream );
+    if ( encoded == NULL ) return MZ_QD_IMAGE_ERROR_MEMORY;
+
+    output = (uint8_t*) calloc ( profile->container_size, 1u );
+    if ( output == NULL ) {
+        free ( encoded );
+        return MZ_QD_IMAGE_ERROR_MEMORY;
+    }
+    if ( profile->format == MZ_QD_IMAGE_FORMAT_HXC ) {
+        memcpy ( output, s_hxc_signature, sizeof ( s_hxc_signature ) );
+        write_le32 ( output + 8u, 0u );
+        write_le32 ( output + 12u, 1u );
+        write_le32 ( output + 16u, 1u );
+        write_le32 ( output + 20u, 0u );
+        write_le32 ( output + 24u, 0u );
+        write_le32 ( output + 28u, profile->bit_rate );
+        write_le32 ( output + 32u, 0u );
+        write_le32 ( output + 36u, profile->descriptor_offset );
+    } else if ( profile->format == MZ_QD_IMAGE_FORMAT_FLASHFLOPPY ) {
+        output[3] = 'Q';
+        output[4] = 'D';
+    } else {
+        free ( encoded );
+        free ( output );
+        return MZ_QD_IMAGE_ERROR_ARGUMENT;
+    }
+
+    write_le32 ( output + profile->descriptor_offset, profile->track_offset );
+    write_le32 ( output + profile->descriptor_offset + 4u, profile->track_length );
+    write_le32 ( output + profile->descriptor_offset + 8u, profile->window_start );
+    write_le32 ( output + profile->descriptor_offset + 12u, profile->window_end );
+    track = output + profile->track_offset;
+    memset ( track, profile->blank_filler, profile->stored_track_length );
+    memcpy ( track + profile->window_start, encoded, encoded_size );
+    free ( encoded );
+    *image = output;
+    *image_size = profile->container_size;
+    return MZ_QD_IMAGE_OK;
+}
+
+mz_qd_image_error_t mz_qd_image_encode ( const uint8_t *logical_image,
+                                         size_t logical_size,
+                                         const mz_qd_image_profile_t *profile,
+                                         uint8_t **image,
+                                         size_t *image_size ) {
+    if ( image == NULL || image_size == NULL || profile == NULL ) {
+        return MZ_QD_IMAGE_ERROR_ARGUMENT;
+    }
+    *image = NULL;
+    *image_size = 0;
+    if ( logical_image == NULL || logical_size == 0u ) {
+        return MZ_QD_IMAGE_ERROR_ARGUMENT;
+    }
+    if ( profile->format == MZ_QD_IMAGE_FORMAT_SHARP_LOGICAL ) {
+        return encode_legacy ( logical_image, logical_size,
+                               profile->container_size, image, image_size );
+    }
+    if ( profile->format == MZ_QD_IMAGE_FORMAT_HXC
+      || profile->format == MZ_QD_IMAGE_FORMAT_FLASHFLOPPY ) {
+        return encode_physical ( logical_image, logical_size, profile,
+                                 image, image_size );
+    }
+    return MZ_QD_IMAGE_ERROR_ARGUMENT;
 }
 
 const char *mz_qd_image_error_string ( mz_qd_image_error_t error ) {
     switch ( error ) {
         case MZ_QD_IMAGE_OK:                return "no error";
-        case MZ_QD_IMAGE_ERROR_ARGUMENT:    return "invalid decoder argument";
+        case MZ_QD_IMAGE_ERROR_ARGUMENT:    return "invalid codec argument";
         case MZ_QD_IMAGE_ERROR_FORMAT:      return "unknown .qd format";
         case MZ_QD_IMAGE_ERROR_TRUNCATED:   return "truncated .qd image";
         case MZ_QD_IMAGE_ERROR_UNSUPPORTED: return "unsupported Quick Disk geometry or encoding";
         case MZ_QD_IMAGE_ERROR_CORRUPT:     return "corrupt Quick Disk container, frame, or CRC";
         case MZ_QD_IMAGE_ERROR_SEQUENCE:    return "inconsistent Quick Disk block sequence";
-        case MZ_QD_IMAGE_ERROR_MEMORY:      return "not enough memory to decode .qd image";
-        default:                            return "unknown .qd decoder error";
+        case MZ_QD_IMAGE_ERROR_CAPACITY:    return "Quick Disk image capacity exceeded";
+        case MZ_QD_IMAGE_ERROR_MEMORY:      return "not enough memory to process .qd image";
+        default:                            return "unknown .qd codec error";
     }
 }

@@ -92,6 +92,8 @@ CFGELM *g_elm_wrprt;
 #ifdef COMPILE_FOR_EMULATOR
 /** CFGELM pro `mz1f11_storage_mode` (TEXT: "cached"|"direct"|"discard"). Faze 3. */
 CFGELM *g_elm_storage_mode;
+/** Profile of the mounted external .qd container, reconstructed on mount. */
+static mz_qd_image_profile_t g_qdisk_image_profile;
 #endif
 
 
@@ -343,7 +345,8 @@ void qdisk_close ( void ) {
                      * při dalším mount). */
                     g_qdisk.user_readonly = 0;
                     g_qdisk.fs_readonly = 0;
-                    g_qdisk.format_readonly = 0;
+                    g_qdisk.external_qd = 0;
+                    memset ( &g_qdisk_image_profile, 0, sizeof ( g_qdisk_image_profile ) );
                     g_qdisk.readonly = 0;
                     /* Faze 3: storage_mode se přepočte při příštím mount z
                      * CFGELM. Reset na CACHED (= default) je bezpečný - žádný
@@ -375,7 +378,74 @@ void qdisk_close ( void ) {
 #define QDISK_CREATE_BLOCK_SIZE 100
 
 
+#ifdef COMPILE_FOR_EMULATOR
+static int qdisk_create_external_qd_image ( const char *filename,
+                                            mz_qd_image_format_t format ) {
+    static const uint8_t empty_logical[8] = {
+        0x00, 0x16, 0x16, 0xa5, 0x00, 'C', 'R', 'C'
+    };
+    mz_qd_image_profile_t profile;
+    mz_qd_image_error_t encode_error;
+    uint8_t *encoded = NULL;
+    size_t encoded_size = 0;
+    GError *io_error = NULL;
+
+    encode_error = mz_qd_image_profile_init_default ( &profile, format );
+    if ( encode_error != MZ_QD_IMAGE_OK ) {
+        baseui_error ( "Can't create QD image '%s': invalid QD format", filename );
+        return 0;
+    };
+    encode_error = mz_qd_image_encode ( empty_logical, sizeof ( empty_logical ),
+                                        &profile, &encoded, &encoded_size );
+    if ( encode_error != MZ_QD_IMAGE_OK ) {
+        baseui_error ( "Can't create QD image '%s': %s", filename,
+                       mz_qd_image_error_string ( encode_error ) );
+        return 0;
+    };
+
+    if ( !g_file_set_contents ( filename, (const gchar*) encoded,
+                                (gssize) encoded_size, &io_error ) ) {
+        baseui_error ( "Can't create QD image '%s': %s", filename,
+                       io_error != NULL ? io_error->message : "write error" );
+        if ( io_error != NULL ) g_error_free ( io_error );
+        free ( encoded );
+        return 0;
+    };
+
+    free ( encoded );
+    return 1;
+}
+
+
+void qdisk_create_qd_image ( char *filename, en_QDISK_CREATE_QD_FORMAT format ) {
+    mz_qd_image_format_t codec_format;
+    switch ( format ) {
+        case QDISK_CREATE_QD_HXC:
+            codec_format = MZ_QD_IMAGE_FORMAT_HXC;
+            break;
+        case QDISK_CREATE_QD_FLASHFLOPPY:
+            codec_format = MZ_QD_IMAGE_FORMAT_FLASHFLOPPY;
+            break;
+        case QDISK_CREATE_QD_SHARP_LEGACY:
+        default:
+            codec_format = MZ_QD_IMAGE_FORMAT_SHARP_LOGICAL;
+            break;
+    };
+    printf ( "\nQuick Disk: create new QD image '%s' (format %d)\n",
+             filename, (int) codec_format );
+    ( void ) qdisk_create_external_qd_image ( filename, codec_format );
+}
+#endif
+
+
 void qdisk_create_image ( char *filename ) {
+
+#ifdef COMPILE_FOR_EMULATOR
+    if ( qdisk_path_is_qd ( filename ) ) {
+        qdisk_create_qd_image ( filename, QDISK_CREATE_QD_SHARP_LEGACY );
+        return;
+    };
+#endif
 
     FILE *fp;
 
@@ -518,9 +588,8 @@ static void qdisk_open_image_internal ( const char *filepath,
                 g_qdisk.user_readonly = cfgelement_get_bool_value ( g_elm_wrprt ) ? 1 : 0;
             };
             g_qdisk.fs_readonly = ( baseui_tools_file_access ( filepath, W_OK ) == -1 ) ? 1 : 0;
-            g_qdisk.format_readonly = 0;
-            g_qdisk.readonly = ( g_qdisk.user_readonly || g_qdisk.fs_readonly
-                              || g_qdisk.format_readonly ) ? 1 : 0;
+            g_qdisk.external_qd = 0;
+            g_qdisk.readonly = ( g_qdisk.user_readonly || g_qdisk.fs_readonly ) ? 1 : 0;
             readonly_effective = g_qdisk.readonly;
             read_only_flag = readonly_effective ? QDSTS_IMG_READONLY : 0;
 
@@ -627,7 +696,7 @@ static void qdisk_open_image_from_buffer_internal ( const uint8_t *data,
      * volající si R/O vynucuje přes user_readonly = 1 (= CFGELM-bypass). */
     g_qdisk.user_readonly = 1;
     g_qdisk.fs_readonly = 0;
-    g_qdisk.format_readonly = 0;
+    g_qdisk.external_qd = 0;
     g_qdisk.readonly = 1;
     unsigned read_only_flag = QDSTS_IMG_READONLY;
 
@@ -666,10 +735,8 @@ static void qdisk_open_image_from_buffer_internal ( const uint8_t *data,
 
 /**
  * Decode an external .qd representation and mount its logical stream in RAM.
- *
- * .qd support is intentionally read-only: writing the internal MZQ stream
- * back over an HxC/FlashFloppy container (or over a legacy image with a
- * different fixed layout) would corrupt the source file.
+ * The source profile is retained so sync can encode the modified logical
+ * stream back into the same legacy/HxC/FlashFloppy representation.
  */
 static void qdisk_open_qd_image_internal ( const char *filepath,
                                            int force_user_readonly,
@@ -679,6 +746,10 @@ static void qdisk_open_qd_image_internal ( const char *filepath,
     GError *io_error = NULL;
     uint8_t *logical = NULL;
     size_t logical_size = 0;
+    uint8_t *working = NULL;
+    size_t working_size = 0;
+    mz_qd_image_profile_t profile;
+    mz_qd_image_profile_t logical_profile;
     mz_qd_image_error_t decode_error;
 
     if ( g_qdisk.connected != QDISK_CONNECTED ) {
@@ -698,8 +769,9 @@ static void qdisk_open_qd_image_internal ( const char *filepath,
         return;
     };
 
-    decode_error = mz_qd_image_decode ( (const uint8_t*) source, (size_t) source_size,
-                                        &logical, &logical_size, NULL );
+    decode_error = mz_qd_image_decode_with_profile (
+        (const uint8_t*) source, (size_t) source_size,
+        &logical, &logical_size, &profile );
     g_free ( source );
     if ( decode_error != MZ_QD_IMAGE_OK || logical_size > QDISK_IMAGE_MAX_SIZE ) {
         const char *message = decode_error != MZ_QD_IMAGE_OK
@@ -713,8 +785,29 @@ static void qdisk_open_qd_image_internal ( const char *filepath,
         return;
     };
 
-    qdisk_open_image_from_buffer_internal ( logical, (uint32_t) logical_size, filepath );
+    /* Expand the decoded stream to the emulator's normal formatted capacity.
+     * A blank physical disk is only eight logical bytes long, while some HxC
+     * images exceed the old 0xf00f-byte legacy container. */
+    memset ( &logical_profile, 0, sizeof ( logical_profile ) );
+    logical_profile.format = MZ_QD_IMAGE_FORMAT_SHARP_LOGICAL;
+    logical_profile.container_size = QDISK_FORMAT_SIZE;
+    decode_error = mz_qd_image_encode ( logical, logical_size, &logical_profile,
+                                        &working, &working_size );
     free ( logical );
+    if ( decode_error != MZ_QD_IMAGE_OK || working_size > QDISK_IMAGE_MAX_SIZE ) {
+        const char *message = decode_error != MZ_QD_IMAGE_OK
+                            ? mz_qd_image_error_string ( decode_error )
+                            : "logical Quick Disk work image exceeds emulator capacity";
+        fprintf ( stderr, "%s(%d): failed to prepare writable QD image '%s': %s\n",
+                  __FILE__, __LINE__, filepath, message );
+        baseui_error ( "Can't prepare QD image '%s': %s", filepath, message );
+        free ( working );
+        if ( !suppress_cfg_write ) cfgelement_set_text_value ( g_elm_std_fp, "" );
+        return;
+    };
+
+    qdisk_open_image_from_buffer_internal ( working, (uint32_t) working_size, filepath );
+    free ( working );
     if ( !g_qdisk.handler_valid ) {
         if ( !suppress_cfg_write ) cfgelement_set_text_value ( g_elm_std_fp, "" );
         return;
@@ -724,11 +817,17 @@ static void qdisk_open_qd_image_internal ( const char *filepath,
                            ? ( force_user_readonly ? 1 : 0 )
                            : ( cfgelement_get_bool_value ( g_elm_wrprt ) ? 1 : 0 );
     g_qdisk.fs_readonly = ( baseui_tools_file_access ( filepath, W_OK ) == -1 ) ? 1 : 0;
-    g_qdisk.format_readonly = 1;
-    g_qdisk.readonly = 1;
-    g_qdisk.storage_mode = QDISK_STORAGE_CACHED;
-    generic_driver_set_handler_readonly_status ( &g_qdisk.handler, 1 );
-    g_qdisk.status |= QDSTS_IMG_READONLY;
+    g_qdisk.external_qd = 1;
+    g_qdisk_image_profile = profile;
+    g_qdisk.readonly = ( g_qdisk.user_readonly || g_qdisk.fs_readonly ) ? 1 : 0;
+    g_qdisk.storage_mode = qdisk_parse_storage_mode (
+        cfgelement_get_text_value ( g_elm_storage_mode ) );
+    if ( g_qdisk.storage_mode == QDISK_STORAGE_DIRECT ) {
+        g_qdisk.storage_mode = QDISK_STORAGE_CACHED;
+    };
+    generic_driver_set_handler_readonly_status ( &g_qdisk.handler, g_qdisk.readonly );
+    if ( g_qdisk.readonly ) g_qdisk.status |= QDSTS_IMG_READONLY;
+    else g_qdisk.status &= ~QDSTS_IMG_READONLY;
 
     if ( !suppress_cfg_write ) cfgelement_set_text_value ( g_elm_std_fp, (char*) filepath );
 }
@@ -868,12 +967,6 @@ static void qdisk_ui_mount_cb(baseui_fchooser_t *fch)
         {
             fch->selected_filePathName = NULL;
             if ( baseui_tools_file_access ( filename, F_OK ) == -1 ) {
-                if ( qdisk_path_is_qd ( filename ) ) {
-                    baseui_error ( "Creating .qd images is not supported yet; select an existing .qd file or create an .mzq image." );
-                    free ( filename );
-                    baseui_filechooser_destroy ( fch );
-                    return;
-                };
                 /* soubor neexistuje - vyrobime novy */
                 //printf ( "create new: '%s'\n", filename );
                 qdisk_create_image ( filename );
@@ -903,7 +996,11 @@ void qdisk_ui_mount ( void ) {
     baseui_fchooser_t *fch = NULL;
 
     if ( g_qdisk.type == QDISK_TYPE_IMAGE ) {
-        fch = baseui_filechooser_open_rw_file(_("Select an .MZQ or read-only .QD image"), ".mzq, .qd", NULL, NULL, cfgelement_get_text_value ( g_elm_std_fp ), qdisk_ui_mount_cb, NULL);
+        GString *filters = g_string_new ( NULL );
+        g_string_append_printf ( filters, "%s{.mzq,.qd}, .mzq, .qd",
+                                 _("All supported Quick Disk images") );
+        fch = baseui_filechooser_open_rw_file(_("Select a Quick Disk image"), filters->str, NULL, NULL, cfgelement_get_text_value ( g_elm_std_fp ), qdisk_ui_mount_cb, NULL);
+        g_string_free ( filters, TRUE );
     } else {
         fch = baseui_filechooser_open_dir(_("Select directory to mount as virtual Quick Disk"), NULL, NULL, cfgelement_get_text_value ( g_elm_virt_fp ), qdisk_ui_mount_cb, NULL);
     };
@@ -943,8 +1040,7 @@ void qdisk_set_write_protected ( int value ) {
      * je write-protected) - effective readonly zustane 1 a user to vidi
      * v UI jako [FS R/O] label. */
     g_qdisk.user_readonly = new_user_ro;
-    g_qdisk.readonly = ( g_qdisk.user_readonly || g_qdisk.fs_readonly
-                      || g_qdisk.format_readonly ) ? 1 : 0;
+    g_qdisk.readonly = ( g_qdisk.user_readonly || g_qdisk.fs_readonly ) ? 1 : 0;
 
     /* Propagace effective stavu do status flagu a do handleru. */
     if ( g_qdisk.readonly ) {
@@ -1031,7 +1127,8 @@ void qdisk_init ( void ) {
      * dopočtou až v qdisk_open_image() po naplnění filename. */
     g_qdisk.user_readonly = cfgelement_get_bool_value ( g_elm_wrprt ) ? 1 : 0;
     g_qdisk.fs_readonly = 0;
-    g_qdisk.format_readonly = 0;
+    g_qdisk.external_qd = 0;
+    memset ( &g_qdisk_image_profile, 0, sizeof ( g_qdisk_image_profile ) );
     g_qdisk.readonly = 0;
 
     /* Fáze 3: init storage_mode z perzistentního INI klíče. Skutečnou volbu
@@ -1766,6 +1863,12 @@ const char *qdisk_get_storage_mode_str ( void ) {
     /* Faze 3: CFGELM default je "cached", takze get_text_value nikdy nevrati
      * NULL pro existujici klic. Pro extra bezpecnost normalizujeme pres
      * parse + tostring (= fallback na "cached" pri neznamem stringu). */
+    if ( g_qdisk.connected == QDISK_CONNECTED
+      && g_qdisk.type == QDISK_TYPE_IMAGE
+      && ( g_qdisk.status & QDSTS_IMG_READY )
+      && g_qdisk.handler_valid ) {
+        return qdisk_storage_mode_to_string ( g_qdisk.storage_mode );
+    };
     const char *raw = cfgelement_get_text_value ( g_elm_storage_mode );
     return qdisk_storage_mode_to_string ( qdisk_parse_storage_mode ( raw ) );
 }
@@ -1776,8 +1879,12 @@ void qdisk_apply_storage_mode_switch ( const char *target_mode ) {
      * Volat z UI thread (nikdy z hot path Z80 emulace). */
     if ( target_mode == NULL ) return;
 
-    /* Normalizujeme pres parser - zamezi ulozeni neznameho stringu do INI. */
-    const char *normalized = qdisk_storage_mode_to_string ( qdisk_parse_storage_mode ( target_mode ) );
+    /* Normalizujeme pres parser - zamezi ulozeni neznameho stringu do INI.
+     * Externí .qd musí zůstat v memory driveru, aby se před zápisem mohl
+     * znovu sestavit celý legacy/HxC/FlashFloppy kontejner. */
+    en_QDISK_STORAGE_MODE requested = qdisk_parse_storage_mode ( target_mode );
+    if ( g_qdisk.external_qd && requested == QDISK_STORAGE_DIRECT ) return;
+    const char *normalized = qdisk_storage_mode_to_string ( requested );
     cfgelement_set_text_value ( g_elm_storage_mode, (char*) normalized );
 
     /* Remount: jen pokud je drive aktualne mountnuty s image / unicard.
@@ -1820,6 +1927,48 @@ int qdisk_drive_has_unsaved_changes ( void ) {
 }
 
 
+static int qdisk_save_memory_to_backing_file ( void ) {
+    if ( g_qdisk.external_qd ) {
+        uint8_t *encoded = NULL;
+        size_t encoded_size = 0;
+        GError *io_error = NULL;
+        mz_qd_image_error_t error = mz_qd_image_encode (
+            g_qdisk.handler.spec.memspec.ptr,
+            g_qdisk.handler.spec.memspec.size,
+            &g_qdisk_image_profile,
+            &encoded,
+            &encoded_size );
+        if ( error != MZ_QD_IMAGE_OK ) {
+            fprintf ( stderr, "%s(%d): failed to encode QD image '%s': %s\n",
+                      __FILE__, __LINE__, g_qdisk.filename,
+                      mz_qd_image_error_string ( error ) );
+            baseui_error ( "Can't save QD image '%s': %s", g_qdisk.filename,
+                           mz_qd_image_error_string ( error ) );
+            return EXIT_FAILURE;
+        }
+
+        /* g_file_set_contents writes the completed encoded buffer through a
+         * temporary file, so validation/capacity errors never damage the
+         * mounted source image. */
+        if ( !g_file_set_contents ( g_qdisk.filename, (const gchar*) encoded,
+                                    (gssize) encoded_size, &io_error ) ) {
+            fprintf ( stderr, "%s(%d): failed to write QD image '%s': %s\n",
+                      __FILE__, __LINE__, g_qdisk.filename,
+                      io_error != NULL ? io_error->message : "write error" );
+            baseui_error ( "Can't save QD image '%s': %s", g_qdisk.filename,
+                           io_error != NULL ? io_error->message : "write error" );
+            if ( io_error != NULL ) g_error_free ( io_error );
+            free ( encoded );
+            return EXIT_FAILURE;
+        }
+        free ( encoded );
+        return EXIT_SUCCESS;
+    }
+
+    return generic_driver_save_memory ( &g_qdisk.handler, g_qdisk.filename );
+}
+
+
 int qdisk_sync_drive ( void ) {
     /* Faze 4: verejny equivalent qdisk_flush_image_to_file(). Pouziva stejnou
      * guard logiku pres qdisk_drive_has_unsaved_changes(), takze no-op pripady
@@ -1827,7 +1976,7 @@ int qdisk_sync_drive ( void ) {
      * zapisu. Po flushi vynuluje memspec.updated. */
     if ( ! qdisk_drive_has_unsaved_changes ( ) ) return 1;
 
-    if ( EXIT_SUCCESS != generic_driver_save_memory ( &g_qdisk.handler, g_qdisk.filename ) ) {
+    if ( EXIT_SUCCESS != qdisk_save_memory_to_backing_file ( ) ) {
         fprintf ( stderr, "%s(%d): qdisk_sync_drive: failed to flush QD image '%s' to file\n",
                   __FILE__, __LINE__, g_qdisk.filename );
         return 0;
@@ -1848,7 +1997,7 @@ int qdisk_drive_force_save_to_file ( void ) {
     if ( g_qdisk.status & QDSTS_IMG_READONLY )                  return 0;
     if ( g_qdisk.filename[0] == 0x00 )                          return 0;
 
-    if ( EXIT_SUCCESS != generic_driver_save_memory ( &g_qdisk.handler, g_qdisk.filename ) ) {
+    if ( EXIT_SUCCESS != qdisk_save_memory_to_backing_file ( ) ) {
         fprintf ( stderr, "%s(%d): qdisk_drive_force_save_to_file: failed for '%s'\n",
                   __FILE__, __LINE__, g_qdisk.filename );
         return 0;

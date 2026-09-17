@@ -292,6 +292,159 @@ static void test_invalid_descriptor_is_rejected ( void ) {
     free ( image );
 }
 
+static mz_qd_image_profile_t make_writable_profile ( mz_qd_image_format_t format ) {
+    mz_qd_image_profile_t profile;
+    memset ( &profile, 0, sizeof ( profile ) );
+    profile.format = format;
+    profile.container_size = 0x2400u;
+    profile.descriptor_offset = 0x200u;
+    profile.track_offset = 0x400u;
+    profile.track_length = 0x2000u;
+    profile.stored_track_length = 0x2000u;
+    profile.window_start = 0x100u;
+    profile.window_end = 0x1f00u;
+    profile.bit_rate = format == MZ_QD_IMAGE_FORMAT_HXC ? 203388u : 0u;
+    profile.blank_filler = format == MZ_QD_IMAGE_FORMAT_HXC ? 0x01u : 0x11u;
+    return profile;
+}
+
+static void test_physical_encode_round_trip ( void ) {
+    size_t source_size;
+    uint8_t *source = make_one_file_hxc ( &source_size );
+    uint8_t *logical = NULL;
+    size_t logical_size = 0;
+    mz_qd_image_format_t variants[2] = {
+        MZ_QD_IMAGE_FORMAT_HXC, MZ_QD_IMAGE_FORMAT_FLASHFLOPPY
+    };
+    unsigned v;
+
+    TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+        mz_qd_image_decode ( source, source_size, &logical, &logical_size, NULL ) );
+    for ( v = 0; v < 2; ++v ) {
+        mz_qd_image_profile_t requested = make_writable_profile ( variants[v] );
+        mz_qd_image_profile_t loaded;
+        uint8_t *encoded = NULL;
+        size_t encoded_size = 0;
+        uint8_t *decoded = NULL;
+        size_t decoded_size = 0;
+
+        TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+            mz_qd_image_encode ( logical, logical_size, &requested,
+                                 &encoded, &encoded_size ) );
+        TEST_ASSERT_EQUAL_size_t ( requested.container_size, encoded_size );
+        TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+            mz_qd_image_decode_with_profile ( encoded, encoded_size,
+                                              &decoded, &decoded_size, &loaded ) );
+        TEST_ASSERT_EQUAL_INT ( variants[v], loaded.format );
+        TEST_ASSERT_EQUAL_UINT32 ( requested.container_size, loaded.container_size );
+        TEST_ASSERT_EQUAL_UINT32 ( requested.descriptor_offset, loaded.descriptor_offset );
+        TEST_ASSERT_EQUAL_UINT32 ( requested.track_offset, loaded.track_offset );
+        TEST_ASSERT_EQUAL_UINT32 ( requested.track_length, loaded.track_length );
+        TEST_ASSERT_EQUAL_UINT32 ( requested.window_start, loaded.window_start );
+        TEST_ASSERT_EQUAL_UINT32 ( requested.window_end, loaded.window_end );
+        TEST_ASSERT_EQUAL_UINT32 ( requested.bit_rate, loaded.bit_rate );
+        TEST_ASSERT_EQUAL_size_t ( logical_size, decoded_size );
+        TEST_ASSERT_EQUAL_UINT8_ARRAY ( logical, decoded, logical_size );
+        free ( decoded );
+        free ( encoded );
+    }
+    free ( logical );
+    free ( source );
+}
+
+static void test_legacy_encode_is_canonical_and_readable ( void ) {
+    size_t source_size;
+    uint8_t *source = make_one_file_hxc ( &source_size );
+    uint8_t *logical = NULL;
+    size_t logical_size = 0;
+    uint8_t *encoded = NULL;
+    size_t encoded_size = 0;
+    uint8_t *decoded = NULL;
+    size_t decoded_size = 0;
+    mz_qd_image_profile_t profile;
+    memset ( &profile, 0, sizeof ( profile ) );
+    profile.format = MZ_QD_IMAGE_FORMAT_SHARP_LOGICAL;
+
+    TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+        mz_qd_image_decode ( source, source_size, &logical, &logical_size, NULL ) );
+    TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+        mz_qd_image_encode ( logical, logical_size, &profile,
+                             &encoded, &encoded_size ) );
+    TEST_ASSERT_EQUAL_size_t ( 0xf00f, encoded_size );
+    TEST_ASSERT_EQUAL_UINT8_ARRAY ( logical, encoded, logical_size );
+    TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+        mz_qd_image_decode ( encoded, encoded_size, &decoded, &decoded_size, NULL ) );
+    TEST_ASSERT_EQUAL_size_t ( encoded_size, decoded_size );
+    TEST_ASSERT_EQUAL_UINT8_ARRAY ( encoded, decoded, encoded_size );
+    free ( decoded );
+    free ( encoded );
+    free ( logical );
+    free ( source );
+}
+
+static void test_legacy_encode_honors_requested_work_size ( void ) {
+    const uint8_t logical[8] = { 0x00, 0x16, 0x16, 0xa5, 0x00, 'C', 'R', 'C' };
+    mz_qd_image_profile_t profile;
+    uint8_t *encoded = NULL;
+    size_t encoded_size = 0;
+    memset ( &profile, 0, sizeof ( profile ) );
+    profile.format = MZ_QD_IMAGE_FORMAT_SHARP_LOGICAL;
+    profile.container_size = 82958u;
+
+    TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+        mz_qd_image_encode ( logical, sizeof ( logical ), &profile,
+                             &encoded, &encoded_size ) );
+    TEST_ASSERT_EQUAL_size_t ( profile.container_size, encoded_size );
+    TEST_ASSERT_EQUAL_UINT8_ARRAY ( logical, encoded, sizeof ( logical ) );
+    TEST_ASSERT_EQUAL_UINT8 ( 0x00, encoded[encoded_size - 1u] );
+    free ( encoded );
+}
+
+static void test_physical_encode_rejects_capacity_overflow ( void ) {
+    const uint8_t logical[8] = { 0x00, 0x16, 0x16, 0xa5, 0x00, 'C', 'R', 'C' };
+    mz_qd_image_profile_t profile = make_writable_profile ( MZ_QD_IMAGE_FORMAT_HXC );
+    uint8_t *encoded = NULL;
+    size_t encoded_size = 0;
+    profile.window_end = profile.window_start + 16u;
+    TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_ERROR_CAPACITY,
+        mz_qd_image_encode ( logical, sizeof ( logical ), &profile,
+                             &encoded, &encoded_size ) );
+    TEST_ASSERT_NULL ( encoded );
+    TEST_ASSERT_EQUAL_size_t ( 0, encoded_size );
+}
+
+static void test_default_profiles_create_readable_blank_images ( void ) {
+    const uint8_t logical[8] = { 0x00, 0x16, 0x16, 0xa5, 0x00, 'C', 'R', 'C' };
+    const mz_qd_image_format_t formats[3] = {
+        MZ_QD_IMAGE_FORMAT_SHARP_LOGICAL,
+        MZ_QD_IMAGE_FORMAT_HXC,
+        MZ_QD_IMAGE_FORMAT_FLASHFLOPPY
+    };
+    unsigned i;
+
+    for ( i = 0; i < 3u; ++i ) {
+        mz_qd_image_profile_t profile;
+        mz_qd_image_format_t detected = MZ_QD_IMAGE_FORMAT_UNKNOWN;
+        uint8_t *encoded = NULL;
+        size_t encoded_size = 0;
+        uint8_t *decoded = NULL;
+        size_t decoded_size = 0;
+        TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+            mz_qd_image_profile_init_default ( &profile, formats[i] ) );
+        TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+            mz_qd_image_encode ( logical, sizeof ( logical ), &profile,
+                                 &encoded, &encoded_size ) );
+        TEST_ASSERT_EQUAL_size_t ( profile.container_size, encoded_size );
+        TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+            mz_qd_image_decode ( encoded, encoded_size, &decoded,
+                                 &decoded_size, &detected ) );
+        TEST_ASSERT_EQUAL_INT ( formats[i], detected );
+        TEST_ASSERT_EQUAL_UINT8 ( 0u, decoded[4] );
+        free ( decoded );
+        free ( encoded );
+    }
+}
+
 int main ( void ) {
     UNITY_BEGIN ();
     RUN_TEST ( test_detects_supported_variants );
@@ -302,5 +455,10 @@ int main ( void ) {
     RUN_TEST ( test_bad_physical_frame_crc_is_rejected );
     RUN_TEST ( test_unsupported_hxc_geometry_is_rejected );
     RUN_TEST ( test_invalid_descriptor_is_rejected );
+    RUN_TEST ( test_physical_encode_round_trip );
+    RUN_TEST ( test_legacy_encode_is_canonical_and_readable );
+    RUN_TEST ( test_legacy_encode_honors_requested_work_size );
+    RUN_TEST ( test_physical_encode_rejects_capacity_overflow );
+    RUN_TEST ( test_default_profiles_create_readable_blank_images );
     return UNITY_END ();
 }
