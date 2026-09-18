@@ -4,19 +4,26 @@
 #include <stdlib.h>
 
 #include "emulator/hw-generic/cmt/cmt_edge.h"
+#include "emulator/hw-generic/cmt/cmt_save.h"
 #include "emulator/hw-generic/cmt/cmtext.h"
 #include "hw-generic/gdg/gdgclk.h"
 
 static const char *g_temp_path = "test_cmt_edge_roundtrip.lep";
+static const char *g_temp_l16_path = "test_cmt_edge_drift.l16";
+static const char *g_temp_wav_path = "test_cmt_save_drift.wav";
 
 void setUp(void)
 {
     remove(g_temp_path);
+    remove(g_temp_l16_path);
+    remove(g_temp_wav_path);
 }
 
 void tearDown(void)
 {
     remove(g_temp_path);
+    remove(g_temp_l16_path);
+    remove(g_temp_wav_path);
 }
 
 static void assert_pulse(st_CMT_STREAM *stream, uint64_t expected_units, int expected_value)
@@ -195,40 +202,218 @@ static void test_recorder_uses_native_rate_and_edge_intervals(void)
     g_cmt_edge_save_extension.cb_eject();
 }
 
+static uint64_t rounded_rational_ticks(uint64_t edge,
+                                       uint64_t units_numerator,
+                                       uint64_t units_denominator,
+                                       uint32_t rate)
+{
+    uint64_t denominator = units_denominator * (uint64_t) rate;
+    uint64_t numerator = edge * units_numerator * (uint64_t) GDGCLK_BASE;
+    return (numerator + denominator / 2u) / denominator;
+}
+
+static void read_and_check_alternating_pulses(st_CMT_STREAM *stream,
+                                               unsigned pulse_count,
+                                               uint64_t minimum_units,
+                                               uint64_t maximum_units,
+                                               uint64_t *total_out)
+{
+    uint64_t total = 0;
+    cmt_vstream_read_reset(stream->str.vstream);
+    for (unsigned pulse = 0; pulse < pulse_count; ++pulse) {
+        uint64_t units = 0;
+        int value = -1;
+        TEST_ASSERT_EQUAL_INT(
+            EXIT_SUCCESS,
+            cmt_vstream_read_pulse(stream->str.vstream, &units, &value));
+        TEST_ASSERT_GREATER_THAN_UINT64(0, units);
+        TEST_ASSERT_TRUE(units >= minimum_units);
+        TEST_ASSERT_TRUE(units <= maximum_units);
+        TEST_ASSERT_EQUAL_INT((int) (pulse & 1u), value);
+        total += units;
+    }
+    {
+        uint64_t units = 0;
+        int value = -1;
+        TEST_ASSERT_EQUAL_INT(
+            EXIT_FAILURE,
+            cmt_vstream_read_pulse(stream->str.vstream, &units, &value));
+    }
+    *total_out = total;
+}
+
 static void test_recorder_quantizes_each_halfwave_independently(void)
 {
     TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS,
                           g_cmt_edge_save_extension.cb_open((char *) g_temp_path));
     TEST_ASSERT_NOT_NULL(g_cmt_edge_save_extension.block);
 
-    /*
-     * 37/8 = 4.625 LEP units per half-wave (~231.25 us).  Each individual
-     * interval rounds to 5 units.  The old absolute/cumulative quantizer
-     * error-diffused this constant-width waveform as 5,4,5,5,4,... .
-     *
-     * For an edge-duration tape format that is undesirable: a Sharp loader
-     * samples one half-wave at a time, so constant physical widths must remain
-     * constant after quantization whenever they round to the same LEP slot.
-     */
-    uint64_t delta_ticks =
-        ((uint64_t) GDGCLK_BASE * 37u) /
-        ((uint64_t) CMT_EDGE_LEP_RATE * 8u);
-
-    TEST_ASSERT_EQUAL_UINT64(
-        5u, cmt_edge_ticks_to_units(delta_ticks, CMT_EDGE_LEP_RATE, NULL));
-
-    for (uint64_t edge = 1; edge <= 8; ++edge) {
-        g_cmt_edge_save_extension.cb_write(delta_ticks * edge, (int) (edge & 1u));
-    }
+    /* 37/8 = 4.625 LEP units per half-wave.  LEP is an edge-duration
+     * format, so every identical physical interval independently rounds to
+     * five units; no error is carried into the following pulse. */
+    uint64_t delta_ticks = rounded_rational_ticks(
+        1u, 37u, 8u, CMT_EDGE_LEP_RATE);
+    for (uint64_t edge = 1; edge <= 8; ++edge)
+        g_cmt_edge_save_extension.cb_write(
+            delta_ticks * edge,
+            (int) (edge & 1u));
 
     st_CMT_STREAM *stream = g_cmt_edge_save_extension.block->stream;
     TEST_ASSERT_NOT_NULL(stream);
-    cmt_vstream_read_reset(stream->str.vstream);
-
-    for (int pulse = 0; pulse < 8; ++pulse)
-        assert_pulse(stream, 5, pulse & 1);
+    uint64_t recorded = 0;
+    read_and_check_alternating_pulses(stream, 8, 5u, 5u, &recorded);
+    TEST_ASSERT_EQUAL_UINT64(40u, recorded);
 
     g_cmt_edge_save_extension.cb_eject();
+}
+
+static void assert_edge_recorder_independent_rounding(
+    const char *path,
+    uint32_t rate,
+    uint64_t units_numerator,
+    uint64_t units_denominator,
+    unsigned edge_count,
+    uint64_t expected_units)
+{
+    TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS,
+                          g_cmt_edge_save_extension.cb_open((char *) path));
+
+    uint64_t delta_ticks = rounded_rational_ticks(
+        1u, units_numerator, units_denominator, rate);
+    TEST_ASSERT_EQUAL_UINT64(
+        expected_units, cmt_edge_ticks_to_units(delta_ticks, rate, NULL));
+
+    for (uint64_t edge = 1; edge <= edge_count; ++edge)
+        g_cmt_edge_save_extension.cb_write(
+            delta_ticks * edge, (int) (edge & 1u));
+
+    st_CMT_STREAM *stream = g_cmt_edge_save_extension.block->stream;
+    TEST_ASSERT_NOT_NULL(stream);
+    TEST_ASSERT_EQUAL_UINT32(rate, cmt_stream_get_rate(stream));
+    uint64_t recorded = 0;
+    read_and_check_alternating_pulses(
+        stream, edge_count, expected_units, expected_units, &recorded);
+    TEST_ASSERT_EQUAL_UINT64(expected_units * edge_count, recorded);
+
+    g_cmt_edge_save_extension.cb_eject();
+}
+
+static void test_lep_469_always_rounds_to_5(void)
+{
+    assert_edge_recorder_independent_rounding(
+        g_temp_path, CMT_EDGE_LEP_RATE, 469u, 100u, 1000u, 5u);
+}
+
+static void test_lep_528_always_rounds_to_5(void)
+{
+    assert_edge_recorder_independent_rounding(
+        g_temp_path, CMT_EDGE_LEP_RATE, 528u, 100u, 1000u, 5u);
+}
+
+static void test_lep_551_always_rounds_to_6(void)
+{
+    assert_edge_recorder_independent_rounding(
+        g_temp_path, CMT_EDGE_LEP_RATE, 551u, 100u, 1000u, 6u);
+}
+
+static void test_l16_469_always_rounds_to_5(void)
+{
+    assert_edge_recorder_independent_rounding(
+        g_temp_l16_path, CMT_EDGE_L16_RATE, 469u, 100u, 1000u, 5u);
+}
+
+static void assert_one_second_recording(uint32_t rate, const char *path)
+{
+    TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS,
+                          g_cmt_edge_save_extension.cb_open((char *) path));
+    g_cmt_edge_save_extension.cb_write((uint64_t) GDGCLK_BASE, 1);
+
+    st_CMT_STREAM *stream = g_cmt_edge_save_extension.block->stream;
+    TEST_ASSERT_NOT_NULL(stream);
+    TEST_ASSERT_EQUAL_UINT32(rate, cmt_stream_get_rate(stream));
+    cmt_vstream_read_reset(stream->str.vstream);
+    assert_pulse(stream, rate, 0);
+    {
+        uint64_t units = 0;
+        int value = -1;
+        TEST_ASSERT_EQUAL_INT(
+            EXIT_FAILURE,
+            cmt_vstream_read_pulse(stream->str.vstream, &units, &value));
+    }
+    g_cmt_edge_save_extension.cb_eject();
+}
+
+static void assert_one_second_continuation_roundtrip(uint32_t rate)
+{
+    size_t capacity = ((size_t) rate + 126u) / 127u;
+    uint8_t *encoded = (uint8_t *) malloc(capacity);
+    TEST_ASSERT_NOT_NULL(encoded);
+
+    size_t written = 0;
+    TEST_ASSERT_EQUAL_INT(
+        EXIT_SUCCESS,
+        cmt_edge_encode_run(1, rate, encoded, capacity, &written));
+    TEST_ASSERT_EQUAL_UINT(capacity, written);
+    TEST_ASSERT_NOT_EQUAL(0, encoded[0]);
+    for (size_t i = 1; i < written; ++i)
+        TEST_ASSERT_EQUAL_UINT8(0, encoded[i]);
+
+    st_CMT_STREAM *stream = cmt_edge_stream_from_data(
+        encoded, written, rate, CMT_STREAM_POLARITY_NORMAL);
+    TEST_ASSERT_NOT_NULL(stream);
+    cmt_vstream_read_reset(stream->str.vstream);
+    assert_pulse(stream, rate, 0);
+
+    cmt_stream_destroy(stream);
+    free(encoded);
+}
+
+static void test_one_second_pulses_and_continuations(void)
+{
+    assert_one_second_recording(CMT_EDGE_LEP_RATE, g_temp_path);
+    assert_one_second_recording(CMT_EDGE_L16_RATE, g_temp_l16_path);
+    assert_one_second_continuation_roundtrip(CMT_EDGE_LEP_RATE);
+    assert_one_second_continuation_roundtrip(CMT_EDGE_L16_RATE);
+}
+
+static void test_subunit_interval_saturates_to_one(void)
+{
+    TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS,
+                          g_cmt_edge_save_extension.cb_open((char *) g_temp_path));
+
+    /* LEP/L16 has no zero-length token; an independently rounded zero is
+     * therefore saturated to the smallest representable run. */
+    g_cmt_edge_save_extension.cb_write(1u, 1);
+    st_CMT_STREAM *stream = g_cmt_edge_save_extension.block->stream;
+    TEST_ASSERT_NOT_NULL(stream);
+    cmt_vstream_read_reset(stream->str.vstream);
+    assert_pulse(stream, 1u, 0);
+
+    g_cmt_edge_save_extension.cb_eject();
+}
+
+static void test_wav_recorder_has_no_long_term_drift(void)
+{
+    const unsigned edge_count = 1000;
+    TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS,
+                          g_cmt_save_extension.cb_open((char *) g_temp_wav_path));
+
+    uint64_t final_ticks = 0;
+    for (uint64_t edge = 1; edge <= edge_count; ++edge) {
+        final_ticks = rounded_rational_ticks(
+            edge, 37u, 8u, CMTSAVE_DEFAULT_SAMPLERATE);
+        g_cmt_save_extension.cb_write(final_ticks, (int) (edge & 1u));
+    }
+
+    st_CMT_STREAM *stream = g_cmt_save_extension.block->stream;
+    TEST_ASSERT_NOT_NULL(stream);
+    TEST_ASSERT_EQUAL_UINT32(CMTSAVE_DEFAULT_SAMPLERATE,
+                             cmt_stream_get_rate(stream));
+    uint64_t expected = cmt_edge_ticks_to_units(
+        final_ticks, CMTSAVE_DEFAULT_SAMPLERATE, NULL);
+    TEST_ASSERT_EQUAL_UINT64(expected, cmt_stream_get_count_scans(stream));
+
+    g_cmt_save_extension.cb_eject();
 }
 
 static void test_recording_extension_selection(void)
@@ -262,6 +447,13 @@ int main(int argc, char *argv[])
     RUN_TEST(test_tick_conversion_has_no_cumulative_drift);
     RUN_TEST(test_recorder_uses_native_rate_and_edge_intervals);
     RUN_TEST(test_recorder_quantizes_each_halfwave_independently);
+    RUN_TEST(test_lep_469_always_rounds_to_5);
+    RUN_TEST(test_lep_528_always_rounds_to_5);
+    RUN_TEST(test_lep_551_always_rounds_to_6);
+    RUN_TEST(test_l16_469_always_rounds_to_5);
+    RUN_TEST(test_one_second_pulses_and_continuations);
+    RUN_TEST(test_subunit_interval_saturates_to_one);
+    RUN_TEST(test_wav_recorder_has_no_long_term_drift);
     RUN_TEST(test_recording_extension_selection);
     int result = UNITY_END();
 

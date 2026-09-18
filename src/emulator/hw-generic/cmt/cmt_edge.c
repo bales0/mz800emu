@@ -409,24 +409,24 @@ static int cmt_edge_record_append(st_CMTEXT_BLOCK *block,
         return EXIT_SUCCESS;
 
     /*
-     * LEP/L16 is an edge-duration format: each stored run describes the
-     * width of one physical level between two adjacent edges.  Quantize that
-     * edge-to-edge interval independently.
+     * LEP/L16 is an edge-duration format, not a sampled waveform.  Quantize
+     * each physical run independently to the nearest format unit.
      *
-     * Do NOT quantize the absolute edge position and subtract a cumulative
-     * number of already emitted units.  At LEP's 50 us resolution that acts
-     * as error diffusion and can turn a stable ~250 us half-wave into a
-     * 200/300 us sequence.  Sharp loaders classify the individual half-wave,
-     * not the accumulated period, so preserving the local pulse width is more
-     * important than preserving the long-term phase of the quantization grid.
+     * Do not carry quantization error into the next run: the stored width of
+     * one pulse must not depend on previous pulses.  WAV is different and
+     * keeps its own sample-phase/error accumulator.
+     *
+     * The stored physical level is still the level that existed BEFORE the
+     * current edge.
      */
     uint64_t delta_ticks = end_ticks - spec->last_ticks;
-
     int ok = 0;
     uint64_t count = cmt_edge_ticks_to_units(delta_ticks, spec->rate, &ok);
     if (!ok)
         return EXIT_FAILURE;
 
+    /* LEP/L16 cannot encode an empty run.  Saturation affects only intervals
+     * shorter than half of the smallest format unit. */
     if (count == 0)
         count = 1;
     if (count > UINT32_MAX)

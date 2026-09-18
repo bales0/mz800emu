@@ -2165,6 +2165,21 @@ static int qdisk_save_memory_to_backing_file ( void ) {
                 return EXIT_SUCCESS;
             };
 
+            /* Některé ROM po odmítnutí příliš velkého souboru provedou
+             * ještě jeden pomocný/retry zápis. Ten může skončit dříve, než
+             * parser znovu rozpozná velikost, a kodek pak vidí pouze neúplný
+             * frame. Pokud už na tomto mountu nastal kapacitní incident,
+             * jde o jeho následek: vrať transakci a neotvírej zavádějící
+             * dialog o poškozeném image. Skutečné chyby bez předchozího
+             * overflow se nadále normálně hlásí. */
+            if ( g_qdisk.write_capacity_warning_shown
+              && ( error == MZ_QD_IMAGE_ERROR_CORRUPT
+                || error == MZ_QD_IMAGE_ERROR_SEQUENCE
+                || error == MZ_QD_IMAGE_ERROR_TRUNCATED ) ) {
+                qdisk_rollback_write_transaction ( );
+                return EXIT_SUCCESS;
+            };
+
             fprintf ( stderr, "%s(%d): failed to encode QD image '%s': %s\n",
                       __FILE__, __LINE__, g_qdisk.filename,
                       mz_qd_image_error_string ( error ) );
@@ -2214,7 +2229,6 @@ int qdisk_sync_drive ( void ) {
     if ( ! qdisk_drive_has_unsaved_changes ( ) ) {
         if ( g_qdisk.write_rollback != NULL ) {
             qdisk_discard_write_rollback ( );
-            g_qdisk.write_capacity_warning_shown = 0;
         };
         return 1;
     };
@@ -2226,7 +2240,6 @@ int qdisk_sync_drive ( void ) {
     };
     g_qdisk.handler.spec.memspec.updated = 0;
     qdisk_discard_write_rollback ( );
-    g_qdisk.write_capacity_warning_shown = 0;
     return 1;
 }
 
@@ -2256,7 +2269,6 @@ int qdisk_drive_force_save_to_file ( void ) {
     };
     g_qdisk.handler.spec.memspec.updated = 0;
     qdisk_discard_write_rollback ( );
-    g_qdisk.write_capacity_warning_shown = 0;
     return 1;
 }
 #endif
