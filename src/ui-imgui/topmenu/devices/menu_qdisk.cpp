@@ -161,14 +161,21 @@ void qdisk_create_image_cb(baseui_fchooser_t *fch)
     if (filename)
     {
         const char *filter = fch->selected_filter;
-        if (filter != NULL && strcmp(filter, _("Sharp legacy QD image")) == 0)
+        /* The selected New Image filter is authoritative.  Do not infer a
+         * .qd subtype from its shared extension and do not silently fall
+         * back to another representation if the chooser returns an
+        * unexpected filter name. */
+        if (filter != NULL && strcmp(filter, _("MZQ image")) == 0)
+            qdisk_create_mzq_image((char *)filename);
+        else if (filter != NULL && strcmp(filter, _("FlashFloppy physical QD image")) == 0)
+            qdisk_create_qd_image((char *)filename, QDISK_CREATE_QD_FLASHFLOPPY);
+        else if (filter != NULL && strcmp(filter, _("Sharp legacy QD image")) == 0)
             qdisk_create_qd_image((char *)filename, QDISK_CREATE_QD_SHARP_LEGACY);
         else if (filter != NULL && strcmp(filter, _("HxC physical QD image")) == 0)
             qdisk_create_qd_image((char *)filename, QDISK_CREATE_QD_HXC);
-        else if (filter != NULL && strcmp(filter, _("FlashFloppy physical QD image")) == 0)
-            qdisk_create_qd_image((char *)filename, QDISK_CREATE_QD_FLASHFLOPPY);
         else
-            qdisk_create_image((char *)filename);
+            fprintf(stderr, "%s(%d): can't create QD image '%s': unknown image format selected\n",
+                    __FILE__, __LINE__, filename);
     };
 
     baseui_filechooser_destroy(fch);
@@ -178,11 +185,14 @@ void imgui_qdisk_create_image(void)
 {
     baseui_fchooser_t *fch = NULL;
     GString *filters = g_string_new(NULL);
-    g_string_append_printf(filters, "%s{.mzq}, %s{.qd}, %s{.qd}, %s{.qd}",
+    /* ImGuiFileDialog preserves whitespace after a comma in the collection
+     * title returned by GetCurrentFilter().  Keep separators whitespace-free
+     * so selected_filter exactly matches the labels used by the callback. */
+    g_string_append_printf(filters, "%s{.mzq},%s{.qd},%s{.qd},%s{.qd}",
                            _("MZQ image"),
+                           _("FlashFloppy physical QD image"),
                            _("Sharp legacy QD image"),
-                           _("HxC physical QD image"),
-                           _("FlashFloppy physical QD image"));
+                           _("HxC physical QD image"));
 
     /* Bez pevné přípony: ImGuiFileDialog doplní .mzq nebo .qd podle právě
      * zvoleného konkrétního formátu. */

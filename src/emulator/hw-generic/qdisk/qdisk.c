@@ -500,15 +500,7 @@ void qdisk_create_qd_image ( char *filename, en_QDISK_CREATE_QD_FORMAT format ) 
 #endif
 
 
-void qdisk_create_image ( char *filename ) {
-
-#ifdef COMPILE_FOR_EMULATOR
-    if ( qdisk_path_is_qd ( filename ) ) {
-        qdisk_create_qd_image ( filename, QDISK_CREATE_QD_SHARP_LEGACY );
-        return;
-    };
-#endif
-
+void qdisk_create_mzq_image ( char *filename ) {
     FILE *fp;
 
     printf ( "\nQuick Disk: create new QD image '%s'\n", filename );
@@ -547,6 +539,21 @@ void qdisk_create_image ( char *filename ) {
     };
 
     FS_LAYER_FCLOSE ( fp );
+}
+
+
+void qdisk_create_image ( char *filename ) {
+#ifdef COMPILE_FOR_EMULATOR
+    if ( qdisk_path_is_qd ( filename ) ) {
+        /* A newly-created .qd must be directly usable by FlashFloppy.
+         * Legacy/HxC remain available as explicit choices in Create Image;
+         * an extension alone is otherwise ambiguous and used to produce a
+         * 0xF00F logical stream which FlashFloppy rejects with error 31. */
+        qdisk_create_qd_image ( filename, QDISK_CREATE_QD_FLASHFLOPPY );
+        return;
+    };
+#endif
+    qdisk_create_mzq_image ( filename );
 }
 
 

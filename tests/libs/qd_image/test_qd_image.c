@@ -23,6 +23,13 @@ static void write_le32 ( uint8_t *p, uint32_t value ) {
     p[3] = (uint8_t) ( value >> 24 );
 }
 
+static uint32_t read_le32 ( const uint8_t *p ) {
+    return (uint32_t) p[0]
+         | ( (uint32_t) p[1] << 8 )
+         | ( (uint32_t) p[2] << 16 )
+         | ( (uint32_t) p[3] << 24 );
+}
+
 static uint8_t reverse_bits ( uint8_t value ) {
     value = (uint8_t) ( ( ( value & 0x55u ) << 1 ) | ( ( value >> 1 ) & 0x55u ) );
     value = (uint8_t) ( ( ( value & 0x33u ) << 2 ) | ( ( value >> 2 ) & 0x33u ) );
@@ -81,6 +88,20 @@ static uint8_t *mfm_encode ( const uint8_t *data, size_t size, size_t *encoded_s
     }
     *encoded_size = size * 2u;
     return encoded;
+}
+
+static uint8_t mfm_decode_aligned_byte ( const uint8_t *encoded,
+                                         size_t byte_index ) {
+    size_t first_data_cell = byte_index * 16u + 1u;
+    uint8_t value = 0;
+    unsigned bit;
+    for ( bit = 0; bit < 8u; ++bit ) {
+        size_t position = first_data_cell + bit * 2u;
+        if ( encoded[position >> 3] & ( 1u << ( position & 7u ) ) ) {
+            value |= (uint8_t) ( 1u << bit );
+        }
+    }
+    return value;
 }
 
 static uint8_t *make_container ( mz_qd_image_format_t format,
@@ -321,13 +342,19 @@ static void test_physical_encode_round_trip ( void ) {
     TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
         mz_qd_image_decode ( source, source_size, &logical, &logical_size, NULL ) );
     for ( v = 0; v < 2; ++v ) {
-        mz_qd_image_profile_t requested = make_writable_profile ( variants[v] );
+        mz_qd_image_profile_t requested;
         mz_qd_image_profile_t loaded;
         uint8_t *encoded = NULL;
         size_t encoded_size = 0;
         uint8_t *decoded = NULL;
         size_t decoded_size = 0;
 
+        if ( variants[v] == MZ_QD_IMAGE_FORMAT_FLASHFLOPPY ) {
+            TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+                mz_qd_image_profile_init_default ( &requested, variants[v] ) );
+        } else {
+            requested = make_writable_profile ( variants[v] );
+        }
         TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
             mz_qd_image_encode ( logical, logical_size, &requested,
                                  &encoded, &encoded_size ) );
@@ -350,6 +377,47 @@ static void test_physical_encode_round_trip ( void ) {
     }
     free ( logical );
     free ( source );
+}
+
+static void test_flashfloppy_encode_uses_canonical_qdf_placement ( void ) {
+    const uint8_t logical[8] = { 0x00, 0x16, 0x16, 0xa5, 0x00, 'C', 'R', 'C' };
+    mz_qd_image_profile_t profile;
+    uint8_t *encoded = NULL;
+    size_t encoded_size = 0;
+    size_t i;
+    const uint8_t *mfm;
+    size_t qdf_header = 0x12eau - 16u;
+
+    TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+        mz_qd_image_profile_init_default ( &profile,
+                                           MZ_QD_IMAGE_FORMAT_FLASHFLOPPY ) );
+    TEST_ASSERT_EQUAL_INT ( MZ_QD_IMAGE_OK,
+        mz_qd_image_encode ( logical, sizeof ( logical ), &profile,
+                             &encoded, &encoded_size ) );
+
+    TEST_ASSERT_EQUAL_size_t ( 0x32000u, encoded_size );
+    TEST_ASSERT_EQUAL_UINT8 ( 'Q', encoded[3] );
+    TEST_ASSERT_EQUAL_UINT8 ( 'D', encoded[4] );
+    TEST_ASSERT_EQUAL_UINT32 ( 0x400u, read_le32 ( encoded + 0x200u ) );
+    TEST_ASSERT_EQUAL_UINT32 ( 0x31a99u, read_le32 ( encoded + 0x204u ) );
+    TEST_ASSERT_EQUAL_UINT32 ( 0x31a9u, read_le32 ( encoded + 0x208u ) );
+    TEST_ASSERT_EQUAL_UINT32 ( 0x2b745u, read_le32 ( encoded + 0x20cu ) );
+    for ( i = 0x400u; i < 0x3a90u; ++i ) {
+        TEST_ASSERT_EQUAL_UINT8 ( 0x11u, encoded[i] );
+    }
+    TEST_ASSERT_EQUAL_UINT8 ( 0x55u, encoded[0x3a90u] );
+    TEST_ASSERT_EQUAL_UINT8 ( 0x11u, encoded[0x3a90u + 0x28000u] );
+    mfm = encoded + 0x3a90u;
+    TEST_ASSERT_EQUAL_UINT8 ( 0x00u, mfm_decode_aligned_byte ( mfm, 0u ) );
+    for ( i = 0; i < 9u; ++i ) {
+        TEST_ASSERT_EQUAL_UINT8 ( 0x16u,
+            mfm_decode_aligned_byte ( mfm, qdf_header + i ) );
+    }
+    TEST_ASSERT_EQUAL_UINT8 ( 0xa5u,
+        mfm_decode_aligned_byte ( mfm, qdf_header + 9u ) );
+    TEST_ASSERT_EQUAL_UINT8 ( 0x00u,
+        mfm_decode_aligned_byte ( mfm, qdf_header + 10u ) );
+    free ( encoded );
 }
 
 static void test_legacy_encode_is_canonical_and_readable ( void ) {
@@ -456,6 +524,7 @@ int main ( void ) {
     RUN_TEST ( test_unsupported_hxc_geometry_is_rejected );
     RUN_TEST ( test_invalid_descriptor_is_rejected );
     RUN_TEST ( test_physical_encode_round_trip );
+    RUN_TEST ( test_flashfloppy_encode_uses_canonical_qdf_placement );
     RUN_TEST ( test_legacy_encode_is_canonical_and_readable );
     RUN_TEST ( test_legacy_encode_honors_requested_work_size );
     RUN_TEST ( test_physical_encode_rejects_capacity_overflow );

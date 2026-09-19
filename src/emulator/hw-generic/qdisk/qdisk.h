@@ -308,6 +308,7 @@ extern "C"
     void qdisk_umount(void);
     void qdisk_set_write_protected(int value);
     void qdisk_create_image(char *filename);
+    void qdisk_create_mzq_image(char *filename);
 #ifdef COMPILE_FOR_EMULATOR
     void qdisk_create_qd_image(char *filename, en_QDISK_CREATE_QD_FORMAT format);
 #endif
