@@ -637,7 +637,7 @@ void cmt_init(void)
     GString *gs = g_string_new(0);
     g_string_append_printf(gs, "%s{.mzf,.m12,.mzt,.tap,.wav,.wave,.lep,.l16}", _("All Supported CMT Files"));
     g_string_append_printf(gs, ", %s{.mzt,.tap}", _("Tape Files"));
-    g_string_append_printf(gs, ", .mzf, .m12, .mzt, .tap, .wav, .wave, .lep, .l16, .*");
+    g_string_append_printf(gs, ", .mzf, .m12, .mzt, .tap, .wav, .wave, .lep{.lep}, .l16{.l16}, .*");
     g_ui_cmt_filters = g_string_free(gs, FALSE);
 
     ui_cmt_window_update();
