@@ -306,14 +306,15 @@ void imgui_menu_qdisk(void)
 
             ImGui::Separator();
 
-            const char *mount_label = (QDISK_TEST_TYPE_IMAGE) ? _("Mount Image...") : _("Mount Directory...");
+            const bool is_mounted = (drive_option != drive_empty);
+            const char *mount_label = is_mounted ? _("Re-Mount...") : _("Mount...");
 
-            if (ImGui::MenuItem(mount_label, NULL, false, (drive_option == drive_empty)))
+            if (ImGui::MenuItem(mount_label, NULL, false, true))
             {
                 qdisk_ui_mount();
             };
 
-            if (ImGui::MenuItem(_L("Unmount"), NULL, false, (drive_option != drive_empty)))
+            if (ImGui::MenuItem(_L("Unmount"), NULL, false, is_mounted))
             {
                 qdisk_umount();
             };
